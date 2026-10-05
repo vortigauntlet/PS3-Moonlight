@@ -16,6 +16,7 @@
 #include <sysutil/sysutil.h>
 #include <sysutil/video.h>
 #include <tiny3d.h>
+#include <lv2/systime.h>
 
 #include "audio.h"
 #include "connection.h"
@@ -165,6 +166,9 @@ static int g_host_quit_sent = 0;
 static void sysutil_exit_callback(u64 status, u64 param, void *usrdata) {
   (void)param;
   (void)usrdata;
+  // The XMB is in front: the stream is not, so the pad must not keep buzzing.
+  if (status == SYSUTIL_MENU_OPEN) ps3input_set_rumble_paused(1);
+  if (status == SYSUTIL_MENU_CLOSE) ps3input_set_rumble_paused(0);
   if (status == SYSUTIL_EXIT_GAME) {
     NLOG("SYSUTIL_EXIT_GAME received. Exiting Moonlight PS3...");
     // Quit the app on the host FIRST.  After this event the system gives the
@@ -174,8 +178,108 @@ static void sysutil_exit_callback(u64 status, u64 param, void *usrdata) {
       g_host_quit_sent = 1;
       hv_quit_app(g_active_hinfo);
     }
+    ps3input_rumble_stop();
+    usleep(40000); // let the input thread deliver the zero before the system kills us
     LiInterruptConnection();
     ui_stop();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Host identity helpers.  A saved host is recognised by the host's own
+// <uniqueid>, so a changed IP or a renamed PC does not cost a re-pair.
+// ---------------------------------------------------------------------------
+
+// A saved host stopped answering at its address.  Scan the LAN and look for its
+// uniqueid at a different one; if found, re-point the saved host there.
+static int relocate_saved_host(int idx) {
+  const ui_saved_host_t *h = ui_get_saved_host(idx);
+  if (!h || !h->uuid[0]) return 0;
+  char want[40];
+  snprintf(want, sizeof(want), "%s", h->uuid);
+  char old_addr[16];
+  snprintf(old_addr, sizeof(old_addr), "%s", h->address);
+
+  NLOG("Host %s did not answer; scanning for uniqueid %s...", old_addr, want);
+  mld_host_t found[MLD_MAX_HOSTS];
+  int n = mld_scan(found, MLD_MAX_HOSTS, 0);
+  for (int i = 0; i < n; i++) {
+    if (strcmp(found[i].address, old_addr) == 0) continue;
+    char uuid[40];
+    if (hv_probe_host_uuid(found[i].address, uuid, sizeof(uuid)) != 0) continue;
+    if (strcmp(uuid, want) != 0) continue;
+    NLOG("Host moved: %s -> %s (%s)", old_addr, found[i].address, found[i].name);
+    ui_set_host_address(idx, found[i].address, found[i].name);
+    ui_save_settings();
+    return 1;
+  }
+  NLOG("Host with uniqueid %s not found on the LAN", want);
+  return 0;
+}
+
+// Menu-side view of the selected host: is anything running on it?  Refreshed
+// from the idle loop while the main menu is up.  The host's /serverinfo
+// <currentgame> is the truth, so it also survives an app restart.
+static handshake_info_t menu_info;
+static int menu_info_ready = 0;
+static int menu_host_idx = -1;
+static int menu_game = 0;
+static char menu_game_name[64] = "";
+static u64 menu_next_probe_us = 0;
+static int menu_prev_state = -1;
+
+static void menu_status_clear(void) {
+  menu_game = 0;
+  menu_game_name[0] = '\0';
+  ui_set_host_status(0, "", 0);
+}
+
+static void menu_probe_tick(void) {
+  int state = ui_get_state();
+  int entered = (menu_prev_state != UI_STATE_IP_ENTRY && state == UI_STATE_IP_ENTRY);
+  menu_prev_state = state;
+  if (state != UI_STATE_IP_ENTRY) return;
+  if (entered) menu_next_probe_us = 0;
+
+  int quit_wanted = ui_take_quit_request();
+  int idx = ui_get_selected_host_index();
+  const ui_saved_host_t *sh = ui_get_saved_host(idx);
+  // Only a paired host will answer over HTTPS.
+  if (!sh || !sh->paired) {
+    if (menu_info_ready) { menu_info_ready = 0; menu_status_clear(); }
+    return;
+  }
+
+  if (!menu_info_ready || idx != menu_host_idx || strcmp(sh->address, menu_info.address) != 0) {
+    menu_status_clear();
+    if (hv_init(&menu_info, sh->address) != 0) return;
+    hv_bind_host_identity(&menu_info);
+    menu_host_idx = idx;
+    menu_info_ready = 1;
+    menu_next_probe_us = 0;
+  }
+
+  if (quit_wanted) {
+    hv_quit_app_background(&menu_info);
+    menu_status_clear();
+    menu_next_probe_us = 0;
+  }
+
+  u64 now = sysGetSystemTime();
+  if (now < menu_next_probe_us) return;
+
+  int game = 0;
+  if (hv_get_current_game(&menu_info, &game) == 0) {
+    if (game != menu_game) {
+      menu_game_name[0] = '\0';
+      if (game) hv_app_name_for_id(&menu_info, game, menu_game_name, sizeof(menu_game_name));
+      menu_game = game;
+    }
+    ui_set_host_status(game, menu_game_name, menu_info.is_apollo);
+    menu_next_probe_us = now + 8ULL * 1000000ULL;
+  } else {
+    menu_status_clear();
+    menu_next_probe_us = now + 20ULL * 1000000ULL;
   }
 }
 
@@ -270,6 +374,24 @@ int main(int argc, char **argv) {
       }
 
       NLOG("Discovery: found %d host(s).", found);
+
+      // A saved host that came back under a different address: follow it by its
+      // uniqueid instead of leaving the old address to fail.
+      for (int i = 0; i < found; i++) {
+        int known = 0;
+        for (int k = 0; k < ui_get_saved_host_count(); k++)
+          if (strcmp(ui_get_saved_host(k)->address, hosts[i].address) == 0) known = 1;
+        if (known) continue;
+        char uuid[40];
+        if (hv_probe_host_uuid(hosts[i].address, uuid, sizeof(uuid)) != 0) continue;
+        int moved = ui_find_host_by_uuid(uuid);
+        if (moved >= 0) {
+          NLOG("Discovery: saved host %d moved %s -> %s", moved,
+               ui_get_saved_host(moved)->address, hosts[i].address);
+          ui_set_host_address(moved, hosts[i].address, hosts[i].name);
+          ui_save_settings();
+        }
+      }
       ui_set_discovered_hosts(hosts, found);
 
       while (ui_is_running() && ui_get_state() == UI_STATE_DISCOVERY && !ui_is_host_selected()) {
@@ -289,7 +411,15 @@ int main(int argc, char **argv) {
       char chosen_ip[64]; char chosen_name[64];
       if (ui_get_selected_host_ip(chosen_ip, sizeof(chosen_ip)) &&
           ui_get_selected_host_name(chosen_name, sizeof(chosen_name))) {
-        int host_idx = ui_upsert_saved_host(chosen_name, chosen_ip);
+        char chosen_uuid[40] = "";
+        hv_probe_host_uuid(chosen_ip, chosen_uuid, sizeof(chosen_uuid));
+        int host_idx = ui_find_host_by_uuid(chosen_uuid);
+        if (host_idx >= 0) {
+          ui_set_host_address(host_idx, chosen_ip, chosen_name);
+        } else {
+          host_idx = ui_upsert_saved_host(chosen_name, chosen_ip);
+          ui_set_host_uuid(host_idx, chosen_uuid);
+        }
         ui_select_host(host_idx);
         ui_save_settings();
         char logmsg[96];
@@ -316,6 +446,24 @@ int main(int argc, char **argv) {
         NLOG("H: hv_init failed!");
         ui_set_state(UI_STATE_ERROR);
         continue;
+      }
+
+      // Key the pairing on the host's uniqueid (migrating an address-keyed one).
+      // If the host does not answer and we know its uniqueid, it may have moved.
+      {
+        int sel = ui_get_selected_host_index();
+        if (hv_bind_host_identity(&hinfo) != 0) {
+          const ui_saved_host_t *sh0 = ui_get_saved_host(sel);
+          if (sh0 && sh0->uuid[0] && ui_get_state() == UI_STATE_PAIRING && relocate_saved_host(sel)) {
+            pcIp = ui_get_target_ip();
+            if (hv_init(&hinfo, pcIp) == 0) hv_bind_host_identity(&hinfo);
+          }
+        }
+        const ui_saved_host_t *sh1 = ui_get_saved_host(sel);
+        if (hinfo.host_uuid[0] && sh1 && strcmp(sh1->uuid, hinfo.host_uuid) != 0) {
+          ui_set_host_uuid(sel, hinfo.host_uuid);
+          ui_save_settings();
+        }
       }
 
       uint32_t random_value;
@@ -557,6 +705,7 @@ int main(int argc, char **argv) {
 
         NLOG("Returning to Main Menu.");
         LiStopConnection();
+        ps3input_rumble_stop();
         if (user_left && ui_get_quit_on_exit() && !g_host_quit_sent) {
           g_host_quit_sent = 1;
           hv_quit_app(&hinfo);
@@ -572,6 +721,7 @@ int main(int argc, char **argv) {
       }
     }
     
+    menu_probe_tick();
     sysUtilCheckCallback();
     usleep(50000);
   }

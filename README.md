@@ -90,8 +90,12 @@ the standard requests.
 
 ## Resolution
 
-Selectable 1280x720, 1792x1008 or 1920x1080, independent of the 30/50/60/120 FPS
-picker (120 is for 720p). Default stays 720p. What each combination asks of the
+Selectable 960x544, 1280x720, 1792x1008 or 1920x1080, independent of the 30/50/60/120 FPS
+picker (120 is for 720p and 960x544). Default is 720p, or 960x544 when the console
+is outputting standard definition. The choice is saved as `stream_res=WIDTHxHEIGHT`
+(the old `res_idx` is still read). 960x544 needs 57% less decode than 720p and is the
+lowest-latency mode TEE PS3 Remoteplay measured; it always decodes to ARGB32, since
+its chroma pitch (480) cannot be a 64-byte-aligned YUV texture. What each combination asks of the
 decoder, as H.264 macroblock rate:
 
 | mode | macroblock rate | H.264 level needed | Moonlight reference bitrate |
@@ -226,6 +230,35 @@ shown, replaced before display, and discarded before decode, per second),
 
 ---
 
+## Settings, controls and display
+
+The Settings page scrolls and is grouped (Video, Network & Host, Controls,
+Display); L1 / R1 jump a page. Options that used to be `config.ini`-only
+(`low_latency`, `ntsc_rate`, `virtual_display`, `quit_on_exit`, `intra_refresh`,
+`vdec_spus`) are now rows in it.
+
+- **Rumble** (`rumble=1`): the host's rumble goes to the DS3 motors. The large motor
+  follows the request; the small one is on/off (on at >= 25%). It is only
+  commanded when the value changes, at most every 20 ms, and is silenced when the
+  stream ends, the connection drops, the app quits, or the XMB opens.
+- **Triggers** (`trigger_mode=1`): analog L2/R2 from the DS3's pressure sensors,
+  enabled on every connected port. The digital L2/R2 bit decides "pressed";
+  pressure only sets how hard (dead zone below 8, full at 230+). A pad that reports
+  no pressure still gives a full-strength trigger. `trigger_mode=0` forces digital.
+- **Host identity**: a pairing is keyed on the host's own `<uniqueid>`, not its IP,
+  so a DHCP change or a rename does not need a re-pair. An existing IP-keyed pairing
+  is migrated automatically on first contact. A saved host that stops answering is
+  looked up on the LAN by its uniqueid and the saved address is updated.
+- **Quit app on host**: the main menu shows *Quit <app> on host* while the host's
+  `/serverinfo` reports something running (so it also works after a dropped
+  connection or a client restart).
+- **Overscan** (`overscan_x`, `overscan_y` in %, `overscan_xoff`, `overscan_yoff`):
+  shrink and shift the whole picture, menus and stream together, so the edges
+  survive a CRT or a TV that crops the signal. Defaults are 100% / 0, and 90% x 92%
+  on an SD output.
+
+---
+
 ## Controls & Key Bindings
 
 | Action | Controller | Keyboard / Mouse |
@@ -286,6 +319,8 @@ Upon completion, the build outputs the following installable files in `build/`:
 - **[Moonlight Common C](https://github.com/moonlight-stream/moonlight-common-c)**: Common GameStream client library.
 - **[Tiny3D](https://github.com/ps3dev/ps3libraries)** by Hermes: a patched copy of `tiny3d.c` ships in `third_party/tiny3d_yuvfix/` to fix the green terms of its planar YUV shader (see that folder's README).
 - **[TEE PS3 Remoteplay](https://github.com/TheErsysEnding/TEE-PS3-Remoteplay-PC-games-on-PS3-Streaming)** and mohasi's cell-stream: the measurements that showed 1080p60 is decodable on a PS3 when deblocking and CABAC are off, and that 59.94 Hz is the rate to stream at.
+- **[Okeanos86](https://github.com/Okeanos86/PS3-Moonlight)**: the mDNS host discovery, and the ideas behind rumble, pressure triggers, the Name (IP) host row, host-keyed pairing, the quit-app menu item and SD / 960x544 overscan output, re-implemented here.
+- **GarryJerry**: the Square / Triangle face-button fix.
 - **[Vibepollo](https://github.com/Nonary/Vibepollo)** / **[Apollo](https://github.com/ClassicOldSong/Apollo)**: the per-client overrides, permissions, virtual display and send-pacing features this client uses when available.
 
 ## Acknowledgments & Special Thanks

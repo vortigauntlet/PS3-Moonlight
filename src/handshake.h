@@ -12,6 +12,7 @@ typedef struct {
     char client_key_path[256];
     char server_cert_hash_path[256];
     char unique_id[64];
+    char host_uuid[40];          // the HOST's <uniqueid> (not ours); "" until known
     char rtsp_session_url[256];
     char server_app_version[32]; // e.g. "7.1.431.0" from /serverinfo
 
@@ -66,6 +67,16 @@ int hv_launch(handshake_info_t *info, int app_id, const char *app_uuid,
               int virtual_display, const char *rikey, int rikeyid);
 // Ask the host to quit the running app / end the session (/cancel).
 int hv_quit_app(handshake_info_t *info);
+// Same, for the main menu (shorter timeouts, does not abort on the menu state).
+int hv_quit_app_background(handshake_info_t *info);
+
+// Host identity: key the pinned certificate on the host's <uniqueid> from
+// plain-HTTP /serverinfo, migrating a pairing saved under the old IP-keyed name.
+int hv_probe_host_uuid(const char *address, char *out, size_t out_size);
+int hv_bind_host_identity(handshake_info_t *info);
+// What is running on the host right now (0 = nothing); needs a paired client.
+int hv_get_current_game(handshake_info_t *info, int *game_id);
+int hv_app_name_for_id(handshake_info_t *info, int app_id, char *out, size_t out_size);
 // Human-readable list of permissions this client is missing for streaming,
 // or 0 if nothing is missing / the host does not use permissions.
 int hv_missing_permissions(const handshake_info_t *info, char *out, size_t out_size);

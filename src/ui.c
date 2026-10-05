@@ -132,9 +132,47 @@ static int ui_packet_size_idx = 0; // Default: 1024, matching earlier builds
 // 1792x1008 (appended, so saved indices keep their meaning) is 16:9 at 7056
 // MB/frame, 13.5% less decode than 1080p for a picture that scales to the TV
 // almost untouched.  TEE PS3 Remoteplay measured it at 60 fps with zero drops.
-static int ui_res_options[][2] = {{1280, 720}, {1920, 1080}, {1792, 1008}};
+//
+// 960x544 is 2040 MB/frame, 57% less decode than 720p.  TEE PS3 Remoteplay
+// measured it at 120+ fps with the lowest latency the console reaches.  It is
+// also the sensible stream for a standard-definition output.
+//
+// Saved as stream_res=WIDTHxHEIGHT, not an index, so entries can be added in
+// display order.  The old res_idx key is still read through ui_res_legacy.
+static int ui_res_options[][2] = {{960, 544}, {1280, 720}, {1792, 1008}, {1920, 1080}};
+static const int ui_res_legacy[][2] = {{1280, 720}, {1920, 1080}, {1792, 1008}};
 #define NUM_RES_OPTIONS (int)(sizeof(ui_res_options) / sizeof(ui_res_options[0]))
-static int ui_res_idx = 0; // Default: 1280x720
+#define RES_IDX_960 0
+#define RES_IDX_720 1
+static int ui_res_idx = RES_IDX_720; // Default: 1280x720
+static int ui_res_configured = 0;    // config.ini named a resolution
+static int ui_output_is_sd = 0;      // console video output is below 1280 wide
+
+static int ui_res_index_for(int w, int h) {
+    for (int i = 0; i < NUM_RES_OPTIONS; i++)
+        if (ui_res_options[i][0] == w && ui_res_options[i][1] == h) return i;
+    return -1;
+}
+
+// Controls.
+// Rumble: forward the host's rumble requests to the DS3 motors.
+// config.ini: rumble (1 = on, 0 = off)
+static int ui_rumble = 1;
+// Trigger mode: 1 = analog (DS3 pressure, with a digital fallback for pads that
+// report none), 0 = always digital (full 255 when the L2/R2 button is down).
+// config.ini: trigger_mode
+static int ui_trigger_mode = 1;
+
+// Overscan correction, applied to the whole picture (menus and the stream) so
+// the edges survive a CRT or a TV that crops the signal.  Scale is the percent
+// of the screen used; offset is in 1280x720 units and moves the picture.
+// The defaults are 100% / 0 on HDMI and a modest shrink on SD outputs, where
+// cropping is the norm.  config.ini: overscan_x, overscan_y, overscan_xoff,
+// overscan_yoff
+#define OVS_SCALE_MIN 70
+#define OVS_OFF_LIMIT 60
+static int ui_ovs_x = 100, ui_ovs_y = 100, ui_ovs_xoff = 0, ui_ovs_yoff = 0;
+static int ui_ovs_configured = 0;
 
 // VDEC output pixel format.
 //   0 = ARGB32   - VDEC does the YUV->RGB conversion itself and writes 4 bytes
@@ -214,11 +252,26 @@ static int ui_quit_on_exit = 1;
 static int ui_low_latency = 1;
 
 // Navigation item counts for Main Menu and Settings Submenu
-#define MAIN_MENU_ITEM_COUNT 3
+// Host / Settings / Connect, plus "Quit app on host" while the host reports one running.
+#define MAIN_MENU_ITEM_COUNT (host_running_app ? 4 : 3)
 static int active_main_item = 0; // 0: Sunshine Host IP, 1: Configure Settings, 2: Connect/Pair
 
-#define SETTINGS_ITEM_COUNT 11
-static int active_settings_item = 0; // 0: FPS, 1: Resolution, 2: Bitrate, 3: Packet Size, 4: Mouse, 5: VSync, 6: Stats, 7: Verbose, 8: Pixel Format, 9: Decode Speed, 10: Back
+// Settings rows, in display order (grouped).
+enum {
+    // Video
+    SR_FPS, SR_RES, SR_BITRATE, SR_PIXFMT, SR_DEBLOCK, SR_PRESENT, SR_NTSC, SR_SPUS,
+    // Network & host
+    SR_PACKET, SR_INTRA, SR_VDISPLAY, SR_QUITEXIT,
+    // Controls
+    SR_MOUSE, SR_RUMBLE, SR_TRIGGERS,
+    // Display
+    SR_VSYNC, SR_OVS_X, SR_OVS_Y, SR_OVS_XOFF, SR_OVS_YOFF, SR_STATS, SR_VERBOSE,
+    SR_BACK,
+    SETTINGS_ITEM_COUNT
+};
+#define SETTINGS_VISIBLE 10
+static int active_settings_item = 0;
+static int settings_scroll = 0;
 
 static int frames_drawn_this_sec = 0;
 static int ui_fps_actual = 0;
@@ -254,7 +307,11 @@ static unsigned int ui_mode_mb_rate(void) {
 int ui_get_packet_size() { return ui_packet_size_options[ui_packet_size_idx]; }
 int ui_get_stream_width(void)  { return ui_res_options[ui_res_idx][0]; }
 int ui_get_stream_height(void) { return ui_res_options[ui_res_idx][1]; }
-int ui_get_pixel_format(void)  { return ui_pixfmt; }
+// YUV420P needs 64-byte-aligned plane pitches for the RSX texture: the chroma
+// pitch is width/2, so 960 wide (480) cannot use it and falls back to ARGB32.
+int ui_get_pixel_format(void)  { return (ui_pixfmt && ((ui_res_options[ui_res_idx][0] / 2) % 64) == 0) ? 1 : 0; }
+int ui_get_rumble(void)        { return ui_rumble; }
+int ui_get_trigger_mode(void)  { return ui_trigger_mode; }
 int ui_get_intra_refresh(void) { return ui_intra_refresh; }
 int ui_get_virtual_display(void) { return ui_virtual_display; }
 int ui_get_quit_on_exit(void) { return ui_quit_on_exit; }
@@ -392,6 +449,45 @@ void ui_set_host_last_app(int idx, int app_id) {
     saved_hosts[idx].last_app_id = app_id;
 }
 
+void ui_set_host_uuid(int idx, const char *uuid) {
+    if (idx < 0 || idx >= saved_host_count || !uuid) return;
+    snprintf(saved_hosts[idx].uuid, sizeof(saved_hosts[idx].uuid), "%s", uuid);
+}
+
+int ui_find_host_by_uuid(const char *uuid) {
+    if (!uuid || !*uuid) return -1;
+    for (int i = 0; i < saved_host_count; i++)
+        if (saved_hosts[i].uuid[0] && strcmp(saved_hosts[i].uuid, uuid) == 0) return i;
+    return -1;
+}
+
+void ui_set_host_address(int idx, const char *address, const char *name) {
+    if (idx < 0 || idx >= saved_host_count || !address || !*address) return;
+    snprintf(saved_hosts[idx].address, sizeof(saved_hosts[idx].address), "%s", address);
+    if (name && *name) snprintf(saved_hosts[idx].name, sizeof(saved_hosts[idx].name), "%s", name);
+    if (idx == selected_host_idx) ui_set_target_ip(address);
+}
+
+// Host status, written by the main thread and read by the UI thread.  Small
+// scalars and one string, written name-first: a torn read shows at worst a
+// stale label for one frame.
+static volatile int host_running_app = 0;
+static char host_running_name[64] = "";
+static volatile int host_is_apollo = 0;
+static volatile int quit_request = 0;
+
+void ui_set_host_status(int running_app, const char *app_name, int apollo_family) {
+    snprintf(host_running_name, sizeof(host_running_name), "%s", app_name ? app_name : "");
+    host_is_apollo = apollo_family ? 1 : 0;
+    host_running_app = running_app ? 1 : 0;
+}
+
+int ui_take_quit_request(void) {
+    if (!quit_request) return 0;
+    quit_request = 0;
+    return 1;
+}
+
 // Host Discovery State
 static mld_host_t discovered_hosts[MLD_MAX_HOSTS];
 static int discovered_host_count = 0;
@@ -481,7 +577,13 @@ void ui_save_settings(void) {
     fprintf(f, "bitrate_kbps=%d\n", ui_bitrate_options[ui_bitrate_idx]);
     fprintf(f, "ntsc_rate=%d\n", ui_ntsc_rate);
     fprintf(f, "packet_size_idx=%d\n", ui_packet_size_idx);
-    fprintf(f, "res_idx=%d\n", ui_res_idx);
+    fprintf(f, "stream_res=%dx%d\n", ui_res_options[ui_res_idx][0], ui_res_options[ui_res_idx][1]);
+    fprintf(f, "rumble=%d\n", ui_rumble);
+    fprintf(f, "trigger_mode=%d\n", ui_trigger_mode);
+    fprintf(f, "overscan_x=%d\n", ui_ovs_x);
+    fprintf(f, "overscan_y=%d\n", ui_ovs_y);
+    fprintf(f, "overscan_xoff=%d\n", ui_ovs_xoff);
+    fprintf(f, "overscan_yoff=%d\n", ui_ovs_yoff);
     fprintf(f, "pixfmt=%d\n", ui_pixfmt);
     fprintf(f, "intra_refresh=%d\n", ui_intra_refresh);
     fprintf(f, "virtual_display=%d\n", ui_virtual_display);
@@ -498,6 +600,7 @@ void ui_save_settings(void) {
         fprintf(f, "\n[host.%d]\n", i);
         fprintf(f, "name=%s\n", saved_hosts[i].name);
         fprintf(f, "address=%s\n", saved_hosts[i].address);
+        if (saved_hosts[i].uuid[0]) fprintf(f, "uuid=%s\n", saved_hosts[i].uuid);
         fprintf(f, "paired=%d\n", saved_hosts[i].paired);
         fprintf(f, "last_app=%d\n", saved_hosts[i].last_app_id);
     }
@@ -573,7 +676,28 @@ void ui_load_settings(void) {
             }
             else if (strcmp(key, "ntsc_rate") == 0) ui_ntsc_rate = (atoi(val) != 0);
             else if (strcmp(key, "packet_size_idx") == 0) { int v = atoi(val); if (v>=0&&v<NUM_PACKET_SIZE_OPTIONS) ui_packet_size_idx=v; }
-            else if (strcmp(key, "res_idx") == 0) { int v = atoi(val); if (v>=0&&v<NUM_RES_OPTIONS) ui_res_idx=v; }
+            else if (strcmp(key, "stream_res") == 0) {
+                int w = 0, h = 0;
+                if (sscanf(val, "%dx%d", &w, &h) == 2) {
+                    int i = ui_res_index_for(w, h);
+                    if (i >= 0) { ui_res_idx = i; ui_res_configured = 1; }
+                }
+            }
+            else if (strcmp(key, "res_idx") == 0) {
+                // Pre-stream_res config: index into the old ladder.  A stream_res
+                // line, if present, wins whichever order they appear in.
+                int v = atoi(val);
+                if (!ui_res_configured && v >= 0 && v < (int)(sizeof(ui_res_legacy) / sizeof(ui_res_legacy[0]))) {
+                    int i = ui_res_index_for(ui_res_legacy[v][0], ui_res_legacy[v][1]);
+                    if (i >= 0) { ui_res_idx = i; ui_res_configured = 1; }
+                }
+            }
+            else if (strcmp(key, "rumble") == 0) ui_rumble = (atoi(val) != 0);
+            else if (strcmp(key, "trigger_mode") == 0) ui_trigger_mode = (atoi(val) != 0);
+            else if (strcmp(key, "overscan_x") == 0) { int v = atoi(val); if (v>=OVS_SCALE_MIN&&v<=100) { ui_ovs_x=v; ui_ovs_configured=1; } }
+            else if (strcmp(key, "overscan_y") == 0) { int v = atoi(val); if (v>=OVS_SCALE_MIN&&v<=100) { ui_ovs_y=v; ui_ovs_configured=1; } }
+            else if (strcmp(key, "overscan_xoff") == 0) { int v = atoi(val); if (v>=-OVS_OFF_LIMIT&&v<=OVS_OFF_LIMIT) { ui_ovs_xoff=v; ui_ovs_configured=1; } }
+            else if (strcmp(key, "overscan_yoff") == 0) { int v = atoi(val); if (v>=-OVS_OFF_LIMIT&&v<=OVS_OFF_LIMIT) { ui_ovs_yoff=v; ui_ovs_configured=1; } }
             else if (strcmp(key, "pixfmt") == 0) { int v = atoi(val); if (v==0||v==1) ui_pixfmt=v; }
             else if (strcmp(key, "intra_refresh") == 0) ui_intra_refresh = (atoi(val) != 0);
             else if (strcmp(key, "virtual_display") == 0) ui_virtual_display = (atoi(val) != 0);
@@ -596,6 +720,8 @@ void ui_load_settings(void) {
                 strncpy(saved_hosts[current_host_idx].name, val, sizeof(saved_hosts[current_host_idx].name) - 1);
             else if (strcmp(key, "address") == 0)
                 strncpy(saved_hosts[current_host_idx].address, val, sizeof(saved_hosts[current_host_idx].address) - 1);
+            else if (strcmp(key, "uuid") == 0)
+                snprintf(saved_hosts[current_host_idx].uuid, sizeof(saved_hosts[current_host_idx].uuid), "%s", val);
             else if (strcmp(key, "paired") == 0) saved_hosts[current_host_idx].paired = atoi(val);
             else if (strcmp(key, "last_app") == 0) saved_hosts[current_host_idx].last_app_id = atoi(val);
         }
@@ -854,8 +980,18 @@ void ui_init(int width, int height) {
         log_mutex_initialized = 1;
     }
 
+    // Standard-definition output (480i/p, 576i/p): crops the picture and has
+    // no use for a 720p stream.  Defaults only; config.ini still wins.
+    ui_output_is_sd = (ui_width < 1280);
+    if (ui_output_is_sd) {
+        ui_ovs_x = 90;
+        ui_ovs_y = 92;
+    }
+
     // Load persisted Host IP and stream settings from HDD
     ui_load_settings();
+
+    if (ui_output_is_sd && !ui_res_configured) ui_res_idx = RES_IDX_960;
     char cfg_log[96];
     snprintf(cfg_log, sizeof(cfg_log), "Config: Target Host [%s]", target_ip_str);
     ui_push_log(cfg_log);
@@ -1144,6 +1280,148 @@ static void ui_init_fonts() {
     SetFontColor(0xffffffff, 0x00000000);
 }
 
+// ---------------------------------------------------------------------------
+// Settings page: a scrolling list, one row per SR_* id, grouped.
+// ---------------------------------------------------------------------------
+static const char *settings_labels[SETTINGS_ITEM_COUNT] = {
+    "Target FPS:", "Resolution:", "Target Bitrate:", "Decoder Output:", "Decode Speed:",
+    "Presentation:", "Refresh Rate:", "Decoder SPUs:",
+    "Packet Size:", "Intra Refresh:", "Virtual Display:", "Quit App On Exit:",
+    "Mouse Mode:", "Rumble:", "Triggers:",
+    "VSync Mode:", "Picture Width:", "Picture Height:", "Shift Horizontal:", "Shift Vertical:",
+    "Stats Overlay:", "Verbose Logging:",
+    ""
+};
+static const char *settings_group_names[] = {"Video Settings", "Network & Host", "Controls", "Display", "Settings"};
+static const unsigned char settings_group[SETTINGS_ITEM_COUNT] = {
+    0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1,
+    2, 2, 2,
+    3, 3, 3, 3, 3, 3, 3,
+    4
+};
+
+static void settings_clamp_scroll(void) {
+    if (active_settings_item < settings_scroll) settings_scroll = active_settings_item;
+    if (active_settings_item >= settings_scroll + SETTINGS_VISIBLE)
+        settings_scroll = active_settings_item - SETTINGS_VISIBLE + 1;
+    if (settings_scroll > SETTINGS_ITEM_COUNT - SETTINGS_VISIBLE) settings_scroll = SETTINGS_ITEM_COUNT - SETTINGS_VISIBLE;
+    if (settings_scroll < 0) settings_scroll = 0;
+}
+
+static void settings_value_text(int row, char *out, size_t n) {
+    switch (row) {
+    case SR_FPS: {
+        int x100 = ui_get_refresh_x100();
+        if (x100 % 100) snprintf(out, n, "%d.%02d FPS", x100 / 100, x100 % 100);
+        else snprintf(out, n, "%d FPS", ui_fps);
+        break;
+    }
+    case SR_RES:
+        snprintf(out, n, "%dx%d%s", ui_get_stream_width(), ui_get_stream_height(),
+                 (ui_mode_mb_rate() > 522240u) ? "  (OVER Level 4.2)"
+                 : (ui_mode_mb_rate() > 245760u) ? "  (needs Level 4.2)"
+                 : (ui_res_idx == RES_IDX_960) ? "  (fastest)" : "");
+        break;
+    case SR_BITRATE: {
+        int kbps = ui_bitrate_options[ui_bitrate_idx];
+        if (kbps % 1000 == 0) snprintf(out, n, "%d Mbps", kbps / 1000);
+        else snprintf(out, n, "%.1f Mbps", (float)kbps / 1000.0f);
+        break;
+    }
+    case SR_PACKET:
+        snprintf(out, n, "%d bytes - %s", ui_packet_size_options[ui_packet_size_idx],
+                 (ui_packet_size_options[ui_packet_size_idx] == 1024) ? "original" : "fewer syscalls");
+        break;
+    case SR_PIXFMT:
+        snprintf(out, n, "%s", ui_get_pixel_format() ? "YUV420 (GPU convert, faster)"
+                               : ui_pixfmt ? "ARGB32 (960 wide cannot use YUV)" : "ARGB32 (original)");
+        break;
+    case SR_DEBLOCK:
+        snprintf(out, n, "%s", (ui_no_deblock == 1) ? "FAST (no deblocking)"
+                               : (ui_no_deblock == 0) ? "QUALITY (normal)" : "AUTO (fast at 1080p50/60)");
+        break;
+    case SR_PRESENT:
+        snprintf(out, n, "%s", (ui_low_latency == 2) ? "NEWEST (lowest lag)"
+                               : (ui_low_latency == 0) ? "SMOOTH" : "BALANCED");
+        break;
+    case SR_NTSC:
+        snprintf(out, n, "%s", ui_ntsc_rate ? "59.94 Hz (NTSC)" : "Whole numbers (60 Hz)");
+        break;
+    case SR_SPUS:
+        if (ui_vdec_spus == 0) snprintf(out, n, "AUTO");
+        else snprintf(out, n, "%d", ui_vdec_spus);
+        break;
+    case SR_INTRA:      snprintf(out, n, "%s", ui_intra_refresh ? "ON" : "OFF"); break;
+    case SR_VDISPLAY:   snprintf(out, n, "%s", ui_virtual_display ? "ON (Apollo / Vibepollo)" : "OFF"); break;
+    case SR_QUITEXIT:   snprintf(out, n, "%s", ui_quit_on_exit ? "YES (close it on the host)" : "NO (leave running)"); break;
+    case SR_MOUSE:      snprintf(out, n, "%s", (ui_mouse_mode == 0) ? "GAME (Relative / 3D)" : "DESKTOP (Absolute / 1:1)"); break;
+    case SR_RUMBLE:     snprintf(out, n, "%s", ui_rumble ? "ON" : "OFF"); break;
+    case SR_TRIGGERS:   snprintf(out, n, "%s", ui_trigger_mode ? "ANALOG (pressure)" : "DIGITAL (on / off)"); break;
+    case SR_VSYNC:      snprintf(out, n, "%s", ui_vsync ? "ON (Smooth 60Hz)" : "OFF (Low Latency)"); break;
+    case SR_OVS_X:      snprintf(out, n, "%d%%", ui_ovs_x); break;
+    case SR_OVS_Y:      snprintf(out, n, "%d%%", ui_ovs_y); break;
+    case SR_OVS_XOFF:   snprintf(out, n, "%+d", ui_ovs_xoff); break;
+    case SR_OVS_YOFF:   snprintf(out, n, "%+d", ui_ovs_yoff); break;
+    case SR_STATS:      snprintf(out, n, "%s", show_stats ? "ON" : "OFF"); break;
+    case SR_VERBOSE:    snprintf(out, n, "%s", ui_verbose ? "ON" : "OFF"); break;
+    default:            out[0] = '\0'; break;
+    }
+}
+
+static int settings_step(int v, int dir, int count) { return (v + dir + count) % count; }
+static int settings_clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// Apply one press (dir = +1 / -1) to a row.  Returns 1 if a value changed.
+static int settings_change(int row, int dir) {
+    switch (row) {
+    case SR_FPS: {
+        int i = 0;
+        for (int k = 0; k < NUM_FPS_OPTIONS; k++) if (ui_fps_options[k] == ui_fps) i = k;
+        ui_fps = ui_fps_options[settings_step(i, dir, NUM_FPS_OPTIONS)];
+        return 1;
+    }
+    case SR_RES:     ui_res_idx = settings_step(ui_res_idx, dir, NUM_RES_OPTIONS); ui_res_configured = 1; return 1;
+    case SR_BITRATE: ui_bitrate_idx = settings_step(ui_bitrate_idx, dir, NUM_BITRATE_OPTIONS); return 1;
+    case SR_PACKET:  ui_packet_size_idx = settings_step(ui_packet_size_idx, dir, NUM_PACKET_SIZE_OPTIONS); return 1;
+    case SR_PIXFMT:  ui_pixfmt = !ui_pixfmt; return 1;
+    case SR_DEBLOCK: // AUTO -> QUALITY -> FAST -> AUTO
+        ui_no_deblock = (dir > 0) ? ((ui_no_deblock == 1) ? -1 : ui_no_deblock + 1)
+                                  : ((ui_no_deblock == -1) ? 1 : ui_no_deblock - 1);
+        return 1;
+    case SR_PRESENT: ui_low_latency = settings_step(ui_low_latency, dir, 3); return 1;
+    case SR_NTSC:    ui_ntsc_rate = !ui_ntsc_rate; return 1;
+    case SR_SPUS:    ui_vdec_spus = settings_step(ui_vdec_spus, dir, 7); return 1; // 0 = auto, 1..6
+    case SR_INTRA:   ui_intra_refresh = !ui_intra_refresh; return 1;
+    case SR_VDISPLAY: ui_virtual_display = !ui_virtual_display; return 1;
+    case SR_QUITEXIT: ui_quit_on_exit = !ui_quit_on_exit; return 1;
+    case SR_MOUSE:   ui_mouse_mode = !ui_mouse_mode; return 1;
+    case SR_RUMBLE:  ui_rumble = !ui_rumble; return 1;
+    case SR_TRIGGERS: ui_trigger_mode = !ui_trigger_mode; return 1;
+    case SR_VSYNC:
+        ui_vsync = !ui_vsync;
+        gcmSetFlipMode(ui_vsync ? GCM_FLIP_VSYNC : GCM_FLIP_HSYNC);
+        return 1;
+    case SR_OVS_X:    ui_ovs_x = settings_clamp(ui_ovs_x + 2 * dir, OVS_SCALE_MIN, 100); ui_ovs_configured = 1; return 1;
+    case SR_OVS_Y:    ui_ovs_y = settings_clamp(ui_ovs_y + 2 * dir, OVS_SCALE_MIN, 100); ui_ovs_configured = 1; return 1;
+    case SR_OVS_XOFF: ui_ovs_xoff = settings_clamp(ui_ovs_xoff + 2 * dir, -OVS_OFF_LIMIT, OVS_OFF_LIMIT); ui_ovs_configured = 1; return 1;
+    case SR_OVS_YOFF: ui_ovs_yoff = settings_clamp(ui_ovs_yoff + 2 * dir, -OVS_OFF_LIMIT, OVS_OFF_LIMIT); ui_ovs_configured = 1; return 1;
+    case SR_STATS:   show_stats = !show_stats; return 1;
+    case SR_VERBOSE: ui_verbose = !ui_verbose; return 1;
+    default: return 0;
+    }
+}
+
+// Overscan: shrink the whole picture toward the centre and shift it.  Applied
+// to the 2D viewport before anything is drawn, so menus and the video quad move
+// together.  At 100% / 0 this is the identity (the viewport tiny3d already used).
+static void ui_apply_overscan(void) {
+    float sx = (float)ui_ovs_x / 100.0f, sy = (float)ui_ovs_y / 100.0f;
+    float px = ((float)ui_width * (1.0f - sx)) * 0.5f + SX(ui_ovs_xoff);
+    float py = ((float)ui_height * (1.0f - sy)) * 0.5f + SY(ui_ovs_yoff);
+    tiny3d_UserViewport(1, px, py, sx, sy, 1.0f, 1.0f);
+}
+
 static void ui_loop(void *arg) {
     (void)arg;
     ps3_pad_state_t pad;
@@ -1168,6 +1446,8 @@ static void ui_loop(void *arg) {
         // Handle input for UI menu states when OSK dialog is not actively capturing input
         if (ui_state == UI_STATE_IP_ENTRY) {
             if (!osk_active && !msg_dialog_active) {
+                // The quit row vanishes when the host stops reporting an app.
+                if (active_main_item >= MAIN_MENU_ITEM_COUNT) active_main_item = MAIN_MENU_ITEM_COUNT - 1;
                 // Vertical navigation across main menu rows
                 if (pad.buttons_pressed & UP_FLAG) {
                     active_main_item = (active_main_item + MAIN_MENU_ITEM_COUNT - 1) % MAIN_MENU_ITEM_COUNT;
@@ -1187,15 +1467,18 @@ static void ui_loop(void *arg) {
                     // Settings Submenu: Enter stream configuration menu
                     if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                         ui_state = UI_STATE_SETTINGS;
-                        active_settings_item = 0;
+                        active_settings_item = 0; settings_scroll = 0;
                     }
                 } else if (active_main_item == 2) {
                     // Connect / Pair action button
                     if (pad.buttons_pressed & A_FLAG) {
                         ui_state = UI_STATE_PAIRING;
                     }
+                } else if (active_main_item == 3) {
+                    // Quit the app the host says is running (main thread sends /cancel)
+                    if (pad.buttons_pressed & A_FLAG) quit_request = 1;
                 }
-                
+
                 // START button initiates connection immediately from anywhere in main menu
                 if (pad.buttons_pressed & PLAY_FLAG) {
                     ui_state = UI_STATE_PAIRING;
@@ -1207,104 +1490,36 @@ static void ui_loop(void *arg) {
                 }
             }
         } else if (ui_state == UI_STATE_SETTINGS) {
-            // Vertical navigation across settings submenu rows
+            // Vertical navigation across the scrolling settings list
             if (pad.buttons_pressed & UP_FLAG) {
                 active_settings_item = (active_settings_item + SETTINGS_ITEM_COUNT - 1) % SETTINGS_ITEM_COUNT;
             }
             if (pad.buttons_pressed & DOWN_FLAG) {
                 active_settings_item = (active_settings_item + 1) % SETTINGS_ITEM_COUNT;
             }
-            
-            if (active_settings_item == 0) {
-                // Target FPS selection (30 / 50 / 60)
-                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
-                    int i = 0;
-                    for (int k = 0; k < NUM_FPS_OPTIONS; k++) if (ui_fps_options[k] == ui_fps) i = k;
-                    ui_fps = ui_fps_options[(i + 1) % NUM_FPS_OPTIONS];
-                    ui_save_settings();
-                }
-                if (pad.buttons_pressed & LEFT_FLAG) {
-                    int i = 0;
-                    for (int k = 0; k < NUM_FPS_OPTIONS; k++) if (ui_fps_options[k] == ui_fps) i = k;
-                    ui_fps = ui_fps_options[(i + NUM_FPS_OPTIONS - 1) % NUM_FPS_OPTIONS];
-                    ui_save_settings();
-                }
-            } else if (active_settings_item == 1) {
-                // Stream resolution selection
-                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
-                    ui_res_idx = (ui_res_idx + 1) % NUM_RES_OPTIONS;
-                    ui_save_settings();
-                }
-                if (pad.buttons_pressed & LEFT_FLAG) {
-                    ui_res_idx = (ui_res_idx + NUM_RES_OPTIONS - 1) % NUM_RES_OPTIONS;
-                    ui_save_settings();
-                }
-            } else if (active_settings_item == 2) {
-                // Target Bitrate selection
-                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
-                    ui_bitrate_idx = (ui_bitrate_idx + 1) % NUM_BITRATE_OPTIONS;
-                    ui_save_settings();
-                }
-                if (pad.buttons_pressed & LEFT_FLAG) {
-                    ui_bitrate_idx = (ui_bitrate_idx + NUM_BITRATE_OPTIONS - 1) % NUM_BITRATE_OPTIONS;
-                    ui_save_settings();
-                }
-            } else if (active_settings_item == 3) {
-                // RTP packet size selection
-                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
-                    ui_packet_size_idx = (ui_packet_size_idx + 1) % NUM_PACKET_SIZE_OPTIONS;
-                    ui_save_settings();
-                }
-                if (pad.buttons_pressed & LEFT_FLAG) {
-                    ui_packet_size_idx = (ui_packet_size_idx + NUM_PACKET_SIZE_OPTIONS - 1) % NUM_PACKET_SIZE_OPTIONS;
-                    ui_save_settings();
-                }
-            } else if (active_settings_item == 4) {
-                // Mouse Mode toggle (0: Game / Relative <-> 1: Desktop / Absolute)
-                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
-                    ui_mouse_mode = !ui_mouse_mode;
-                    ui_save_settings();
-                }
-            } else if (active_settings_item == 5) {
-                // VSync toggle
-                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
-                    ui_vsync = !ui_vsync;
-                    gcmSetFlipMode(ui_vsync ? GCM_FLIP_VSYNC : GCM_FLIP_HSYNC);
-                    ui_save_settings();
-                }
-            } else if (active_settings_item == 6) {
-                // Stats overlay toggle
-                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
-                    show_stats = !show_stats;
-                    ui_save_settings();
-                }
-            } else if (active_settings_item == 7) {
-                // Verbose logging toggle
-                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
-                    ui_verbose = !ui_verbose;
-                    ui_save_settings();
-                }
-            } else if (active_settings_item == 8) {
-                // VDEC output pixel format toggle
-                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
-                    ui_pixfmt = !ui_pixfmt;
-                    ui_save_settings();
-                }
-            } else if (active_settings_item == 9) {
-                // Decode speed / deblocking filter
-                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
-                    // AUTO -> QUALITY -> FAST -> AUTO
-                    ui_no_deblock = (ui_no_deblock == 1) ? -1 : ui_no_deblock + 1;
-                    ui_save_settings();
-                }
-            } else if (active_settings_item == 10) {
-                // Back to Main Menu
+            // L1 / R1 jump a page
+            if (pad.buttons_pressed & LB_FLAG) {
+                active_settings_item -= SETTINGS_VISIBLE - 1;
+                if (active_settings_item < 0) active_settings_item = 0;
+            }
+            if (pad.buttons_pressed & RB_FLAG) {
+                active_settings_item += SETTINGS_VISIBLE - 1;
+                if (active_settings_item >= SETTINGS_ITEM_COUNT) active_settings_item = SETTINGS_ITEM_COUNT - 1;
+            }
+            settings_clamp_scroll();
+
+            if (active_settings_item == SR_BACK) {
                 if (pad.buttons_pressed & A_FLAG) {
                     ui_save_settings();
                     ui_state = UI_STATE_IP_ENTRY;
                 }
+            } else {
+                int dir = 0;
+                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) dir = 1;
+                else if (pad.buttons_pressed & LEFT_FLAG) dir = -1;
+                if (dir && settings_change(active_settings_item, dir)) ui_save_settings();
             }
-            
+
             // Circle button returns to main menu from anywhere in settings
             if (pad.buttons_pressed & B_FLAG) {
                 ui_save_settings();
@@ -1364,6 +1579,7 @@ static void ui_loop(void *arg) {
         }
 
         // 1. Draw UI / Video (Top 70%)
+        ui_apply_overscan();
         tiny3d_UserViewportSurface(1, (float)ui_width, (float)ui_height);
         tiny3d_Project2D();
         
@@ -1474,6 +1690,11 @@ static void ui_loop(void *arg) {
                         DrawFormatString(next_x + SX(20), SY(125), "[ %s (%s) ]", sh->name, target_ip_str);
                     else
                         DrawFormatString(next_x + SX(20), SY(125), "[ %s ]", target_ip_str);
+                    if (host_is_apollo) {
+                        SetFontSize(SF(16), SF(16));
+                        SetFontColor(0xff9e9e9e, 0);
+                        DrawString(SX(60), SY(152), "Vibepollo / Apollo host (virtual display available)");
+                    }
                 }
 
                 // Row 1: Settings Sub-menu Link
@@ -1500,6 +1721,15 @@ static void ui_loop(void *arg) {
                 SetFontColor((active_main_item == 2) ? 0xff82b1ff : 0xffffffff, 0);
                 DrawString(SX(60), SY(280), "[ CONNECT / PAIR TO HOST ]");
 
+                // Row 3: only while the host reports an app running
+                if (host_running_app) {
+                    SetFontColor((active_main_item == 3) ? 0xff82b1ff : 0xffffffff, 0);
+                    if (host_running_name[0])
+                        DrawFormatString(SX(60), SY(335), "[ QUIT %s ON HOST ]", host_running_name);
+                    else
+                        DrawString(SX(60), SY(335), "[ QUIT RUNNING APP ON HOST ]");
+                }
+
                 // Clean controls legend
                 SetFontSize(SF(18), SF(18));
                 SetFontColor(0xff9e9e9e, 0);
@@ -1508,101 +1738,37 @@ static void ui_loop(void *arg) {
                 // Title inside #3F51B5 header bar
                 SetFontSize(SF(26), SF(26));
                 SetFontColor(0xffffffff, 0);
-                DrawString(SX(40), SY(18), "Moonlight PS3  -  Stream Settings");
+                DrawFormatString(SX(40), SY(18), "Moonlight PS3  -  %s",
+                                 settings_group_names[settings_group[active_settings_item]]);
 
-                // Row 0: Target FPS
+                // Scrolling list: SETTINGS_VISIBLE rows starting at settings_scroll.
                 SetFontSize(SF(20), SF(20));
-                SetFontColor((active_settings_item == 0) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(105), "Target FPS:");
-                
-                SetFontColor((active_settings_item == 0) ? 0xff82b1ff : 0xffffffff, 0);
-                {
-                    int x100 = ui_get_refresh_x100();
-                    if (x100 % 100)
-                        DrawFormatString(SX(430), SY(105), "[ %d.%02d FPS ]", x100 / 100, x100 % 100);
-                    else
-                        DrawFormatString(SX(430), SY(105), "[ %d FPS ]", ui_fps);
+                for (int v = 0; v < SETTINGS_VISIBLE; v++) {
+                    int r = settings_scroll + v;
+                    if (r >= SETTINGS_ITEM_COUNT) break;
+                    float y = SY(100 + 35 * v);
+                    int active = (r == active_settings_item);
+                    if (r == SR_BACK) {
+                        SetFontColor(active ? 0xff82b1ff : 0xffffffff, 0);
+                        DrawString(SX(60), y, "[ BACK TO MAIN MENU ]");
+                        continue;
+                    }
+                    char val[80];
+                    settings_value_text(r, val, sizeof(val));
+                    SetFontColor(active ? 0xff82b1ff : 0xffb0bec5, 0);
+                    DrawString(SX(60), y, (char *)settings_labels[r]);
+                    SetFontColor(active ? 0xff82b1ff : 0xffffffff, 0);
+                    DrawFormatString(SX(430), y, "[ %s ]", val);
                 }
 
-                // Row 1: Stream Resolution
-                SetFontColor((active_settings_item == 1) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(140), "Resolution:");
-                SetFontColor((active_settings_item == 1) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(140), "[ %dx%d%s ]",
-                                 ui_get_stream_width(), ui_get_stream_height(),
-                                 (ui_mode_mb_rate() > 522240u) ? "  (OVER Level 4.2)"
-                                 : (ui_mode_mb_rate() > 245760u) ? "  (needs Level 4.2)" : "");
-
-                // Row 2: Target Bitrate
-                SetFontColor((active_settings_item == 2) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(175), "Target Bitrate:");
-                
-                SetFontColor((active_settings_item == 2) ? 0xff82b1ff : 0xffffffff, 0);
-                int kbps = ui_bitrate_options[ui_bitrate_idx];
-                if (kbps % 1000 == 0) {
-                    DrawFormatString(SX(430), SY(175), "[ %d Mbps ]", kbps / 1000);
-                } else {
-                    DrawFormatString(SX(430), SY(175), "[ %.1f Mbps ]", (float)kbps / 1000.0f);
-                }
-
-                // Row 3: RTP Packet Size
-                SetFontColor((active_settings_item == 3) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(210), "Packet Size:");
-                SetFontColor((active_settings_item == 3) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(210), "[ %d bytes - %s ]",
-                                 ui_packet_size_options[ui_packet_size_idx],
-                                 (ui_packet_size_options[ui_packet_size_idx] == 1024)
-                                     ? "original" : "fewer syscalls");
-
-                // Row 4: Mouse Mode
-                SetFontColor((active_settings_item == 4) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(245), "Mouse Mode:");
-                
-                SetFontColor((active_settings_item == 4) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(245), "[ %s ]", (ui_mouse_mode == 0) ? "GAME (Relative / 3D)" : "DESKTOP (Absolute / 1:1)");
-
-                // Row 5: VSync Mode
-                SetFontColor((active_settings_item == 5) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(280), "VSync Mode:");
-                
-                SetFontColor((active_settings_item == 5) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(280), "[ %s ]", ui_vsync ? "ON (Smooth 60Hz)" : "OFF (Low Latency)");
-
-                // Row 6: Stats Overlay
-                SetFontColor((active_settings_item == 6) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(315), "Stats Overlay:");
-                
-                SetFontColor((active_settings_item == 6) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(315), "[ %s ]", show_stats ? "ON" : "OFF");
-
-                // Row 7: Verbose Logging
-                SetFontColor((active_settings_item == 7) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(350), "Verbose Logging:");
-                
-                SetFontColor((active_settings_item == 7) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(350), "[ %s ]", ui_verbose ? "ON" : "OFF");
-
-                // Row 8: VDEC Output Pixel Format
-                SetFontColor((active_settings_item == 8) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(385), "Decoder Output:");
-                SetFontColor((active_settings_item == 8) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(385), "[ %s ]",
-                                 ui_pixfmt ? "YUV420 (GPU convert, faster)"
-                                           : "ARGB32 (original)");
-
-                // Row 9: Decode Speed (deblocking filter)
-                SetFontColor((active_settings_item == 9) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(420), "Decode Speed:");
-                SetFontColor((active_settings_item == 9) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(420), "[ %s ]",
-                                 (ui_no_deblock == 1) ? "FAST (no deblocking)"
-                                 : (ui_no_deblock == 0) ? "QUALITY (normal)"
-                                                        : "AUTO (fast at 1080p50/60)");
-
-                // Row 10: Back to Main Menu Button
-                SetFontSize(SF(22), SF(22));
-                SetFontColor((active_settings_item == 10) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawString(SX(60), SY(455), "[ BACK TO MAIN MENU ]");
+                // Position and scroll hints
+                SetFontSize(SF(16), SF(16));
+                SetFontColor(0xff9e9e9e, 0);
+                DrawFormatString(SX(1090), SY(70), "%d / %d", active_settings_item + 1, SETTINGS_ITEM_COUNT);
+                if (settings_scroll > 0)
+                    DrawString(SX(1090), SY(88), "more above");
+                if (settings_scroll + SETTINGS_VISIBLE < SETTINGS_ITEM_COUNT)
+                    DrawString(SX(1090), SY(100 + 35 * SETTINGS_VISIBLE - 18), "more below");
 
                 // Clean controls legend
                 SetFontSize(SF(18), SF(18));

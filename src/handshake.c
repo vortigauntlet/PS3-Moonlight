@@ -35,6 +35,11 @@ static void bin_to_hex(const unsigned char *bin, size_t len, char *out);
 #define SUNSHINE_HTTP_PORT  47989
 #define MAX_HTTP_RESPONSE_SIZE (1024 * 1024)
 
+// Background probes (the menu asking the host what is running, host identity) run
+// while the UI sits in the main menu, so they must neither abort on that state
+// nor block for the full 30 s a pairing request may.
+static volatile int g_probe_mode = 0;
+
 static int connect_with_cancel(int fd, const struct sockaddr *addr, socklen_t addrlen) {
     int nbio = 1;
     setsockopt(fd, SOL_SOCKET, SO_NBIO, &nbio, sizeof(nbio));
@@ -51,8 +56,8 @@ static int connect_with_cancel(int fd, const struct sockaddr *addr, socklen_t ad
     }
 
     int elapsed_ms = 0;
-    while (elapsed_ms < 5000) {
-        if (ui_get_state() == UI_STATE_IP_ENTRY || !ui_is_running()) {
+    while (elapsed_ms < (g_probe_mode ? 2000 : 5000)) {
+        if ((!g_probe_mode && ui_get_state() == UI_STATE_IP_ENTRY) || !ui_is_running()) {
             return -1;
         }
 
@@ -274,7 +279,7 @@ static int ps3_https_request(handshake_info_t *info, const char *url_path, struc
     }
 
     struct timeval tv;
-    tv.tv_sec = 30;
+    tv.tv_sec = (g_probe_mode ? 3 : 30);
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -415,7 +420,7 @@ static int ps3_http_request_ex(handshake_info_t *info, const char *url_path,
     }
 
     struct timeval tv;
-    tv.tv_sec = 30;
+    tv.tv_sec = (g_probe_mode ? 3 : 30);
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     if (wait_secs > 0) tv.tv_sec = 1;
@@ -1458,6 +1463,148 @@ int hv_quit_app(handshake_info_t *info) {
     }
     free(s.ptr);
     return ok ? 0 : -1;
+}
+
+// ---------------------------------------------------------------------------
+// Host identity and background probes
+// ---------------------------------------------------------------------------
+
+// Keep only characters that are safe in a file name and a URL.
+static void sanitize_host_uuid(char *s) {
+    size_t w = 0;
+    for (size_t i = 0; s[i] != '\0'; i++) {
+        if (isalnum((unsigned char)s[i]) || s[i] == '-') s[w++] = s[i];
+    }
+    s[w] = '\0';
+}
+
+static int copy_file(const char *from, const char *to) {
+    FILE *in = fopen(from, "rb");
+    if (!in) return -1;
+    FILE *out = fopen(to, "wb");
+    if (!out) { fclose(in); return -1; }
+    char buf[256];
+    size_t n;
+    int ok = 1;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) { ok = 0; break; }
+    }
+    fclose(in);
+    if (fclose(out) != 0) ok = 0;
+    if (!ok) unlink(to);
+    return ok ? 0 : -1;
+}
+
+static int file_exists(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+// Read <uniqueid> from the host's plain-HTTP /serverinfo.  Needs no pairing.
+// The id is the host's own and survives IP changes and renames.
+int hv_probe_host_uuid(const char *address, char *out, size_t out_size) {
+    if (!address || !out || out_size < 8) return -1;
+    out[0] = '\0';
+    handshake_info_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    snprintf(tmp.address, sizeof(tmp.address), "%s", address);
+    struct string s = {0};
+    g_probe_mode = 1;
+    int rc = ps3_http_request(&tmp, "/serverinfo?uniqueid=0123456789ABCDEF", &s);
+    g_probe_mode = 0;
+    if (rc != 0) return -1;
+    char *id = extract_xml(s.ptr, "uniqueid");
+    free(s.ptr);
+    if (!id) return -1;
+    snprintf(out, out_size, "%s", id);
+    free(id);
+    sanitize_host_uuid(out);
+    return out[0] ? 0 : -1;
+}
+
+// Key the pinned server certificate on the host's uniqueid instead of its IP,
+// so a DHCP change does not orphan the pairing.  A pairing saved under the old
+// IP-keyed name is copied across rather than asking for a re-pair; the old file
+// is left in place so an older build keeps working.  On failure (host not
+// reachable over HTTP) the IP-keyed path set by hv_init stays in force.
+int hv_bind_host_identity(handshake_info_t *info) {
+    if (!info) return -1;
+    char uuid[sizeof(info->host_uuid)];
+    if (hv_probe_host_uuid(info->address, uuid, sizeof(uuid)) != 0) {
+        NLOG("host identity: no uniqueid from %s, keeping the address-keyed pairing", info->address);
+        return -1;
+    }
+    snprintf(info->host_uuid, sizeof(info->host_uuid), "%s", uuid);
+
+    char legacy[sizeof(info->server_cert_hash_path)];
+    snprintf(legacy, sizeof(legacy), "%s", info->server_cert_hash_path);
+    snprintf(info->server_cert_hash_path, sizeof(info->server_cert_hash_path),
+             "/dev_hdd0/game/MNLT00001/USRDIR/server-%s.sha256", uuid);
+
+    if (!file_exists(info->server_cert_hash_path) && file_exists(legacy)) {
+        if (copy_file(legacy, info->server_cert_hash_path) == 0)
+            NLOG("host identity: migrated pairing %s -> uniqueid %s", legacy, uuid);
+        else
+            NLOG("host identity: could not migrate %s", legacy);
+    }
+    NLOG("host identity: uniqueid %s", uuid);
+    return 0;
+}
+
+// Ask the (already paired) host what is running.  game_id: 0 = nothing, else the
+// app id.  This is the host's own truth and survives an app restart.  Also
+// refreshes the Apollo/Vibepollo capability fields.  Returns -1 when the host
+// cannot be reached over HTTPS (not paired, offline).
+int hv_get_current_game(handshake_info_t *info, int *game_id) {
+    if (!info || !game_id) return -1;
+    *game_id = 0;
+    char path[128];
+    struct string s = {0};
+    snprintf(path, sizeof(path), "/serverinfo?uniqueid=%s", info->unique_id);
+    g_probe_mode = 1;
+    int rc = ps3_https_request(info, path, &s);
+    g_probe_mode = 0;
+    if (rc != 0) return -1;
+    parse_host_caps(info, s.ptr);
+    char *cg = extract_xml(s.ptr, "currentgame");
+    if (cg) {
+        *game_id = atoi(cg);
+        free(cg);
+    }
+    free(s.ptr);
+    return 0;
+}
+
+// Name of an app id from the host's list, or "" if it cannot be resolved.
+int hv_app_name_for_id(handshake_info_t *info, int app_id, char *out, size_t out_size) {
+    if (!out || out_size == 0) return -1;
+    out[0] = '\0';
+    ps3_app_list_t *list = malloc(sizeof(*list));
+    if (!list) return -1;
+    memset(list, 0, sizeof(*list));
+    g_probe_mode = 1;
+    int rc = hv_get_app_list(info, list);
+    g_probe_mode = 0;
+    if (rc == 0) {
+        for (int i = 0; i < list->count; i++) {
+            if (list->apps[i].id == app_id) {
+                snprintf(out, out_size, "%s", list->apps[i].name);
+                break;
+            }
+        }
+    }
+    free(list);
+    return out[0] ? 0 : -1;
+}
+
+// hv_quit_app for callers sitting in the main menu (see g_probe_mode).
+int hv_quit_app_background(handshake_info_t *info) {
+    g_probe_mode = 1;
+    int rc = hv_quit_app(info);
+    g_probe_mode = 0;
+    return rc;
 }
 
 // Parse session URL from response and store in info

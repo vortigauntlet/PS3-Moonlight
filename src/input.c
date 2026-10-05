@@ -8,6 +8,7 @@
 #include <sys/mutex.h>
 #include <sys/thread.h>
 #include <unistd.h>
+#include <lv2/systime.h>
 
 static volatile int active_input_thread = 0;
 static int input_thread_started = 0;
@@ -182,6 +183,46 @@ static uint16_t ps3_translate_keycode_to_vk(u16 code) {
     return 0;
 }
 
+// Rumble requests from the host (any thread) -> flushed to the pads by the input
+// thread, and only when they change.  Ports are DS3 ports; the host's
+// controller number maps straight onto them.
+static volatile u8 rumble_large[MAX_PORT_NUM];
+static volatile u8 rumble_small[MAX_PORT_NUM];
+static volatile int rumble_paused = 0;
+
+void ps3input_set_rumble(unsigned short controller, unsigned short low, unsigned short high) {
+    if (controller >= MAX_PORT_NUM) return;
+    // Large motor: 0-255 speed.  Small motor: on/off, so only a real request
+    // (high >= 0x4000) turns it on, not any non-zero noise.
+    rumble_large[controller] = (u8)(low >> 8);
+    rumble_small[controller] = (high >= 0x4000) ? 1 : 0;
+}
+
+void ps3input_rumble_stop(void) {
+    for (int p = 0; p < MAX_PORT_NUM; p++) {
+        rumble_large[p] = 0;
+        rumble_small[p] = 0;
+    }
+}
+
+// The XMB is open: the stream is not in front, so nothing should buzz.
+void ps3input_set_rumble_paused(int paused) {
+    rumble_paused = paused ? 1 : 0;
+}
+
+// Trigger value from the digital button and the DS3's pressure reading.  The
+// digital bit is the truth of "pressed"; pressure only says how hard.  Pressure
+// is dead-zoned at the bottom and boosted at the top because a DS3 is noisy
+// near zero and rarely reaches 255.  A pad that does not report pressure reads
+// 0 here, which must still be a full press, not a dead trigger.
+static unsigned char trigger_value(int pressed, unsigned pre, int analog) {
+    if (!pressed) return 0;
+    if (!analog || pre == 0) return 0xFF;
+    if (pre <= 8) return 1;
+    if (pre >= 230) return 0xFF;
+    return (unsigned char)(1u + ((pre - 8u) * 254u) / (230u - 8u));
+}
+
 void ps3input_get_data(ps3_pad_state_t *state) {
     if (!state) return;
     if (!pad_state_mutex_initialized) {
@@ -208,6 +249,8 @@ static void input_loop(void *arg) {
     short rightStickY = 0;
     unsigned char leftTrigger = 0;
     unsigned char rightTrigger = 0;
+    u8 act_large[MAX_PORT_NUM] = {0}, act_small[MAX_PORT_NUM] = {0};
+    u64 act_sent_us[MAX_PORT_NUM] = {0}, pressure_try_us[MAX_PORT_NUM] = {0};
 
     // Initialize all input device libraries
     ioPadInit(7);
@@ -217,6 +260,39 @@ static void input_loop(void *arg) {
     while(active_input_thread) {
         // 1. Controller Polling
         ioPadGetInfo(&padinfo);
+        padInfo2 padinfo2;
+        memset(&padinfo2, 0, sizeof(padinfo2));
+        ioPadGetInfo2(&padinfo2);
+        {
+            u64 now_us = sysGetSystemTime();
+            for (u32 port = 0; port < MAX_PORT_NUM; port++) {
+                if (!padinfo.status[port]) {
+                    act_large[port] = 0;
+                    act_small[port] = 0;
+                    continue;
+                }
+                // Pressure mode is per port and lost when a pad reconnects, so
+                // check every pass and ask again (at most twice a second).
+                if (!(padinfo2.port_setting[port] & PAD_SETTINGS_PRESS_ON) &&
+                    now_us - pressure_try_us[port] > 500000ULL) {
+                    ioPadSetPortSetting(port, PAD_SETTINGS_PRESS_ON);
+                    pressure_try_us[port] = now_us;
+                }
+                u8 want_l = (rumble_paused || !ui_get_rumble()) ? 0 : rumble_large[port];
+                u8 want_s = (rumble_paused || !ui_get_rumble()) ? 0 : rumble_small[port];
+                if ((want_l != act_large[port] || want_s != act_small[port]) &&
+                    now_us - act_sent_us[port] >= 20000ULL) {
+                    padActParam act;
+                    memset(&act, 0, sizeof(act));
+                    act.small_motor = want_s;
+                    act.large_motor = want_l;
+                    ioPadSetActDirect(port, &act);
+                    act_large[port] = want_l;
+                    act_small[port] = want_s;
+                    act_sent_us[port] = now_us;
+                }
+            }
+        }
         for(int i = 0; i < 1; i++) { // Polling primary controller (index 0)
             if(padinfo.status[i]) {
                 ioPadGetData(i, &paddata);
@@ -257,8 +333,8 @@ static void input_loop(void *arg) {
                     rightStickX = tempRX > 32767 ? 32767 : (tempRX < -32768 ? -32768 : tempRX);
                     rightStickY = tempRY > 32767 ? 32767 : (tempRY < -32768 ? -32768 : tempRY);
 
-                    leftTrigger = paddata.BTN_L2 ? 0xFF : 0x00;
-                    rightTrigger = paddata.BTN_R2 ? 0xFF : 0x00;
+                    leftTrigger = trigger_value(paddata.BTN_L2, paddata.PRE_L2, ui_get_trigger_mode());
+                    rightTrigger = trigger_value(paddata.BTN_R2, paddata.PRE_R2, ui_get_trigger_mode());
 
                     // Send controller event to Moonlight/Sunshine server
                     LiSendControllerEvent(buttonFlags, leftTrigger, rightTrigger, leftStickX, leftStickY, rightStickX, rightStickY);
@@ -406,6 +482,15 @@ static void input_loop(void *arg) {
         usleep(4000); // 250 Hz polling (4ms) for ultra-low latency
     }
     
+    // Never leave a motor running behind us.
+    for (u32 port = 0; port < MAX_PORT_NUM; port++) {
+        if (act_large[port] || act_small[port]) {
+            padActParam off;
+            memset(&off, 0, sizeof(off));
+            ioPadSetActDirect(port, &off);
+        }
+    }
+
     ioMouseEnd();
     ioKbEnd();
     ioPadEnd();

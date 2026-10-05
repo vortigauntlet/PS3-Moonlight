@@ -29,6 +29,8 @@ int ui_get_stream_height(void);
 int ui_get_pixel_format(void);
 int ui_get_intra_refresh(void);
 int ui_get_no_deblock(void);
+int ui_get_rumble(void);
+int ui_get_trigger_mode(void); // 1 = analog (pressure), 0 = digital
 int ui_get_vdec_spus(void);
 const char* ui_get_target_ip();
 int ui_get_width();
@@ -66,6 +68,7 @@ void ui_reset_app_selection(void);
 typedef struct {
     char name[64];
     char address[16];
+    char uuid[40];   /* host <uniqueid> from /serverinfo; "" until first contact */
     int  paired;
     int  last_app_id; /* -1 = nessuno */
 } ui_saved_host_t;
@@ -77,6 +80,16 @@ void ui_select_host(int idx);
 int  ui_upsert_saved_host(const char *name, const char *address);
 void ui_set_host_paired(int idx, int paired);
 void ui_set_host_last_app(int idx, int app_id);
+void ui_set_host_uuid(int idx, const char *uuid);
+int  ui_find_host_by_uuid(const char *uuid);
+/* Re-point a saved host at a new address (it moved); keeps pairing and uuid. */
+void ui_set_host_address(int idx, const char *address, const char *name);
+
+/* What the selected host reports, refreshed by the main thread.  running_app:
+ * 0 = nothing running, else an app is; name may be "". */
+void ui_set_host_status(int running_app, const char *app_name, int apollo_family);
+/* The user picked "Quit app on host"; returns 1 once per request. */
+int  ui_take_quit_request(void);
 
 // Host discovery state helpers
 void ui_set_discovered_hosts(const mld_host_t *hosts, int count);
