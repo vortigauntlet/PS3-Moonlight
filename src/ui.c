@@ -83,11 +83,11 @@ static int ui_fps = 0;
 // 12.5 Mbps is there because more bits are not automatically better at 60 fps:
 // TEE PS3 Remoteplay measured ~13 Mbps holding 60 fps in 98% of seconds
 // against 82% at ~20.  The decoder has a per-frame budget and bits spend it.
-// 40 and 50 exist to FIND the PS3's UDP receive ceiling, not because they are
-// expected to hold: watch rx= against the step and fecfail= in [PS3-NET].
+// 40, 50 and 60 exist to FIND the PS3's UDP receive ceiling, not because they
+// are expected to hold: watch rx= against the step and fecfail= in [PS3-NET].
 // The request is the step minus 20% (FEC headroom), and Vibepollo's x264
 // with its one-frame VBV has measured at about half of THAT on Cyberpunk.
-static int ui_bitrate_options[] = {2500, 5000, 10000, 12500, 15000, 20000, 25000, 30000, 40000, 50000};
+static int ui_bitrate_options[] = {2500, 5000, 10000, 12500, 15000, 20000, 25000, 30000, 40000, 50000, 60000};
 static const int ui_bitrate_legacy[] = {2500, 5000, 10000, 15000, 20000, 25000, 30000};
 #define NUM_BITRATE_OPTIONS (int)(sizeof(ui_bitrate_options) / sizeof(ui_bitrate_options[0]))
 // Default 20 Mbps (index 4).  Higher than Moonlight's reference for either
@@ -392,6 +392,16 @@ int ui_get_intra_refresh(void) { return ui_intra_refresh; }
 int ui_get_virtual_display(void) { return ui_virtual_display; }
 int ui_get_quit_on_exit(void) { return ui_quit_on_exit; }
 int ui_get_audio_channels(void) { return ui_audio_channels; }
+// The AUDIO_CONFIGURATION_* the stream asks for.  The RTSP setup and the
+// /launch surroundAudioInfo must both come from this, or the host can set up
+// one layout and be told about another.
+int ui_get_audio_configuration(void) {
+    switch (ui_audio_channels) {
+    case 8:  return AUDIO_CONFIGURATION_71_SURROUND;
+    case 6:  return AUDIO_CONFIGURATION_51_SURROUND;
+    default: return AUDIO_CONFIGURATION_STEREO;
+    }
+}
 int ui_get_low_latency(void) { return ui_low_latency; }
 int ui_get_no_deblock(void)    { return ui_no_deblock; }
 int ui_get_vdec_spus(void)     { return ui_vdec_spus; }

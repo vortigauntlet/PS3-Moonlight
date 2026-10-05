@@ -27,6 +27,7 @@
 #include <lv2/systime.h>
 #include "ui.h"
 #include "random.h"
+#include <Limelight.h>
 #include <net/poll.h>
 
 static void bin_to_hex(const unsigned char *bin, size_t len, char *out);
@@ -1401,11 +1402,12 @@ static int build_launch_params(char *path, size_t pathsz,
         "/%s?uniqueid=%s&uuid=%s&appid=%d&mode=%dx%dx%s"
         "&additionalStates=1&sops=1"
         "&rikey=%s&rikeyid=%d"
-        "&localAudioPlayMode=0&surroundAudioInfo=196610"
+        "&localAudioPlayMode=0&surroundAudioInfo=%d"
         "&remoteControllersBitmap=1&gcmap=1&corever=1",
         verb, info->unique_id, uuid_str, app_id,
         ui_get_stream_width(), ui_get_stream_height(), refresh,
-        rikey, rikeyid);
+        rikey, rikeyid,
+        SURROUNDAUDIOINFO_FROM_AUDIO_CONFIGURATION(ui_get_audio_configuration()));
     if (length < 0 || (size_t)length >= pathsz) return -1;
 
     // Apollo/Vibepollo extensions.  Only sent to a host that advertised them,
