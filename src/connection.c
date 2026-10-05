@@ -7,6 +7,7 @@
 
 #include "video.h"
 #include "audio.h"
+#include "input.h"
 #include "net_logger.h"
 
 static volatile int connection_status = LI_DISCONNECTED;
@@ -45,11 +46,12 @@ static void cb_connection_started(void) {
 
 static void cb_connection_terminated(int error_code) {
     NLOG("connectionTerminated err=%d", error_code);
+    ps3input_rumble_stop(); // a motor must not outlive the stream
     connection_status = LI_DISCONNECTED;
 }
 
 static void cb_rumble(unsigned short c, unsigned short l, unsigned short h) {
-    (void)c; (void)l; (void)h;
+    ps3input_set_rumble(c, l, h);
 }
 static void cb_status_update(int status) { NLOG("statusUpdate: %d", status); }
 static void cb_set_hdr(bool enabled) { (void)enabled; }
