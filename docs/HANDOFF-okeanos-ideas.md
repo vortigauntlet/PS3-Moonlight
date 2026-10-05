@@ -51,9 +51,8 @@ triggers = `PRE_L2`/`PRE_R2` (0–255).
 
 **Problems:**
 - **Only port 0** is put into pressure mode.
-- **No fallback:** a pad that does not report pressure (the Sixaxis, many
-  third-party and Bluetooth pads, the PS Move navigation controller) returns
-  `PRE_*` = 0. With their change its triggers stop working entirely.
+- **No fallback:** a pad that does not report pressure (many third-party
+  pads, generic USB gamepads) returns `PRE_*` = 0. With their change its triggers stop working entirely.
 - **Raw values:** DS3 pressure is noisy near zero and rarely reaches 255, so
   triggers drift slightly and never reach full.
 
