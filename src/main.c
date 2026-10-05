@@ -353,6 +353,12 @@ int main(int argc, char **argv) {
          (rr & VIDEO_REFRESH_60HZ)    ? " 60"    : "",
          (rr & VIDEO_REFRESH_30HZ)    ? " 30"    : "",
          (rr & VIDEO_REFRESH_50HZ)    ? "50" : "60 (or 30 at a clean 2:2)");
+    NLOG("output: aspect=%d (%s), scan=%d",
+         vstate.displayMode.aspect,
+         vstate.displayMode.aspect == VIDEO_ASPECT_4_3 ? "4:3"
+         : vstate.displayMode.aspect == VIDEO_ASPECT_16_9 ? "16:9" : "auto",
+         vstate.displayMode.scanMode);
+    ui_set_output_mode(rr, vstate.displayMode.aspect);
   }
 
   ui_init(width, height);

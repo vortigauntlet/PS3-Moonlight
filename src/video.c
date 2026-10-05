@@ -1228,22 +1228,25 @@ void ps3video_draw() {
       screen_height = video_height;
   }
 
+  float qx, qy, qw, qh;
+  ui_stream_rect(screen_width, screen_height, &qx, &qy, &qw, &qh);
+
   tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
 
   // Top-Left
-  tiny3d_VertexPos(0, 0, 65535);
+  tiny3d_VertexPos(qx, qy, 65535);
   tiny3d_VertexTexture(0.0f, 0.0f);
 
   // Top-Right
-  tiny3d_VertexPos(screen_width, 0, 65535);
+  tiny3d_VertexPos(qx + qw, qy, 65535);
   tiny3d_VertexTexture(1.0f, 0.0f);
 
   // Bottom-Left
-  tiny3d_VertexPos(0, screen_height, 65535);
+  tiny3d_VertexPos(qx, qy + qh, 65535);
   tiny3d_VertexTexture(0.0f, 1.0f);
 
   // Bottom-Right
-  tiny3d_VertexPos(screen_width, screen_height, 65535);
+  tiny3d_VertexPos(qx + qw, qy + qh, 65535);
   tiny3d_VertexTexture(1.0f, 1.0f);
 
   tiny3d_End();

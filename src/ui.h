@@ -16,6 +16,14 @@ enum {
 };
 
 void ui_init(int width, int height);
+// The console's active output mode (VIDEO_REFRESH_* bits, VIDEO_ASPECT_*).
+// Call before ui_init; AUTO frame rate and resolution are resolved from it.
+void ui_set_output_mode(int refresh_bits, int aspect);
+int ui_output_is_50hz(void);
+int ui_output_is_4x3(void);
+int ui_get_aspect_mode(void);
+// Screen rectangle for the stream quad, honouring the Picture Shape setting.
+void ui_stream_rect(int screen_w, int screen_h, float *x, float *y, float *w, float *h);
 void ui_push_log(const char *msg);
 void ui_set_state(int state);
 int ui_get_state();

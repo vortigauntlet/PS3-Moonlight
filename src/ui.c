@@ -16,6 +16,7 @@
 #include <sysutil/sysutil.h>
 #include <sysutil/osk.h>
 #include <sysutil/msg.h>
+#include <sysutil/video.h>
 #include <unistd.h>
 #include <lv2/systime.h>
 #include "input.h"
@@ -61,9 +62,12 @@ static char target_ip_str[64] = "192.168.1.1";
 //   hands over whole pictures, so each waits up to one frame interval, and a
 //   shorter interval shortens every wait.  Above ~120 it stops paying -- the
 //   output is 59.94 Hz, so the extra pictures queue at the flip.
-static int ui_fps_options[] = {30, 50, 60, 120};
+//
+// 0 = AUTO: 50 on a 50 Hz output (576i/576p and other PAL modes), otherwise 60,
+// so the stream always paces 1:1 against whatever the console is outputting.
+static int ui_fps_options[] = {0, 30, 50, 60, 120};
 #define NUM_FPS_OPTIONS (int)(sizeof(ui_fps_options) / sizeof(ui_fps_options[0]))
-static int ui_fps = 60;
+static int ui_fps = 0;
 // Bitrate ladder, in kbps.  New steps are APPENDED so a config.ini written by an
 // older build keeps its meaning: index 2 is still 10 Mbps.
 //
@@ -139,14 +143,31 @@ static int ui_packet_size_idx = 0; // Default: 1024, matching earlier builds
 //
 // Saved as stream_res=WIDTHxHEIGHT, not an index, so entries can be added in
 // display order.  The old res_idx key is still read through ui_res_legacy.
-static int ui_res_options[][2] = {{960, 544}, {1280, 720}, {1792, 1008}, {1920, 1080}};
+//
+// The 4:3 modes are square-pixel, so the PC renders a true 4:3 picture for a
+// 4:3 set: 640x480 for 480-line outputs, 768x576 for 576-line ones, 1024x768
+// as the sharper option.  All three keep width/2 a multiple of 64 for YUV420.
+//
+// {0, 0} is AUTO, resolved from the console's output by ui_resolve_res():
+//   SD 4:3 -> 640x480 or 768x576, SD 16:9 -> 960x544, HD -> 1280x720
+//   (1024x768 on an HD output set to 4:3).
+static int ui_res_options[][2] = {{0, 0}, {640, 480}, {768, 576}, {960, 544}, {1024, 768},
+                                  {1280, 720}, {1792, 1008}, {1920, 1080}};
 static const int ui_res_legacy[][2] = {{1280, 720}, {1920, 1080}, {1792, 1008}};
 #define NUM_RES_OPTIONS (int)(sizeof(ui_res_options) / sizeof(ui_res_options[0]))
-#define RES_IDX_960 0
-#define RES_IDX_720 1
-static int ui_res_idx = RES_IDX_720; // Default: 1280x720
+#define RES_IDX_AUTO 0
+static int ui_res_idx = RES_IDX_AUTO;
 static int ui_res_configured = 0;    // config.ini named a resolution
 static int ui_output_is_sd = 0;      // console video output is below 1280 wide
+
+// The console's output mode, read once at startup (main.c).  Nothing here
+// changes it: a bad videoConfigure() blanks the panel on this hardware.
+static int ui_out_refresh_bits = 0;  // VIDEO_REFRESH_* bits of the active mode
+static int ui_out_aspect = 0;        // VIDEO_ASPECT_*: 0 auto, 1 = 4:3, 2 = 16:9
+
+// Picture shape: 0 = FIT (keep the stream's shape, black bars where it does
+// not match the screen), 1 = STRETCH (fill the screen).  config.ini: aspect_mode
+static int ui_aspect_mode = 0;
 
 static int ui_res_index_for(int w, int h) {
     for (int i = 0; i < NUM_RES_OPTIONS; i++)
@@ -264,7 +285,7 @@ static int active_main_item = 0; // 0: Sunshine Host IP, 1: Configure Settings, 
 // Settings rows, in display order (grouped).
 enum {
     // Video
-    SR_FPS, SR_RES, SR_BITRATE, SR_PIXFMT, SR_DEBLOCK, SR_PRESENT, SR_NTSC, SR_SPUS,
+    SR_FPS, SR_RES, SR_ASPECT, SR_BITRATE, SR_PIXFMT, SR_DEBLOCK, SR_PRESENT, SR_NTSC, SR_SPUS,
     // Network & host
     SR_PACKET, SR_INTRA, SR_VDISPLAY, SR_QUITEXIT, SR_AUDIO,
     // Controls
@@ -296,25 +317,75 @@ static u16 osk_output[64];
 void ui_set_state(int state) { ui_state = state; }
 int ui_get_state() { return ui_state; }
 int ui_is_running() { return ui_running; }
-int ui_get_fps() { return ui_fps; }
+void ui_set_output_mode(int refresh_bits, int aspect) {
+    ui_out_refresh_bits = refresh_bits;
+    ui_out_aspect = aspect;
+}
+int ui_output_is_50hz(void) {
+    return (ui_out_refresh_bits & VIDEO_REFRESH_50HZ) &&
+           !(ui_out_refresh_bits & (VIDEO_REFRESH_59_94HZ | VIDEO_REFRESH_60HZ));
+}
+// Shape of the screen itself.  An unreported aspect is guessed from the mode:
+// SD sets are overwhelmingly 4:3, HD modes are 16:9.
+int ui_output_is_4x3(void) {
+    if (ui_out_aspect == VIDEO_ASPECT_4_3) return 1;
+    if (ui_out_aspect == VIDEO_ASPECT_16_9) return 0;
+    return ui_output_is_sd;
+}
+int ui_get_aspect_mode(void) { return ui_aspect_mode; }
+
+int ui_get_fps() {
+    if (ui_fps) return ui_fps;
+    return ui_output_is_50hz() ? 50 : 60;
+}
 int ui_get_bitrate() { return ui_bitrate_options[ui_bitrate_idx]; }
 int ui_get_refresh_x100(void) {
-    if (ui_ntsc_rate && ui_fps != 50) return (ui_fps * 100000 + 500) / 1001;
-    return ui_fps * 100;
+    int fps = ui_get_fps();
+    if (ui_ntsc_rate && fps != 50) return (fps * 100000 + 500) / 1001;
+    return fps * 100;
+}
+
+static void ui_resolve_res(int idx, int *w, int *h) {
+    if (idx != RES_IDX_AUTO) { *w = ui_res_options[idx][0]; *h = ui_res_options[idx][1]; return; }
+    if (ui_output_is_sd && ui_output_is_4x3()) {
+        if (ui_height >= 576) { *w = 768; *h = 576; }
+        else { *w = 640; *h = 480; }
+    } else if (ui_output_is_sd) { *w = 960; *h = 544; }
+    else if (ui_output_is_4x3()) { *w = 1024; *h = 768; }
+    else { *w = 1280; *h = 720; }
 }
 
 // Macroblock rate of the selected mode, for the level hints in the menu.
 static unsigned int ui_mode_mb_rate(void) {
-    unsigned int w = (unsigned int)(ui_res_options[ui_res_idx][0] + 15) / 16;
-    unsigned int h = (unsigned int)(ui_res_options[ui_res_idx][1] + 15) / 16;
-    return w * h * (unsigned int)ui_fps;
+    int sw, sh;
+    ui_resolve_res(ui_res_idx, &sw, &sh);
+    unsigned int w = (unsigned int)(sw + 15) / 16;
+    unsigned int h = (unsigned int)(sh + 15) / 16;
+    return w * h * (unsigned int)ui_get_fps();
 }
 int ui_get_packet_size() { return ui_packet_size_options[ui_packet_size_idx]; }
-int ui_get_stream_width(void)  { return ui_res_options[ui_res_idx][0]; }
-int ui_get_stream_height(void) { return ui_res_options[ui_res_idx][1]; }
+int ui_get_stream_width(void)  { int w, h; ui_resolve_res(ui_res_idx, &w, &h); return w; }
+int ui_get_stream_height(void) { int w, h; ui_resolve_res(ui_res_idx, &w, &h); return h; }
 // YUV420P needs 64-byte-aligned plane pitches for the RSX texture: the chroma
 // pitch is width/2, so 960 wide (480) cannot use it and falls back to ARGB32.
-int ui_get_pixel_format(void)  { return (ui_pixfmt && ((ui_res_options[ui_res_idx][0] / 2) % 64) == 0) ? 1 : 0; }
+int ui_get_pixel_format(void)  { return (ui_pixfmt && ((ui_get_stream_width() / 2) % 64) == 0) ? 1 : 0; }
+
+// Where the stream goes on screen, in output pixels.  FIT keeps the stream's
+// own shape (square pixels from the PC) against the screen's real shape, which
+// for SD is 4:3 or 16:9 whatever the pixel count says (720x480 is either).
+void ui_stream_rect(int screen_w, int screen_h, float *x, float *y, float *w, float *h) {
+    *x = 0.0f; *y = 0.0f; *w = (float)screen_w; *h = (float)screen_h;
+    if (ui_aspect_mode == 1) return;
+    float screen_ar = ui_output_is_4x3() ? (4.0f / 3.0f) : (16.0f / 9.0f);
+    float stream_ar = (float)ui_get_stream_width() / (float)ui_get_stream_height();
+    if (stream_ar > screen_ar * 1.01f) {        // wider: bars top and bottom
+        *h = (float)screen_h * screen_ar / stream_ar;
+        *y = ((float)screen_h - *h) * 0.5f;
+    } else if (stream_ar < screen_ar * 0.99f) { // narrower: bars left and right
+        *w = (float)screen_w * stream_ar / screen_ar;
+        *x = ((float)screen_w - *w) * 0.5f;
+    }
+}
 int ui_get_rumble(void)        { return ui_rumble; }
 int ui_get_trigger_mode(void)  { return ui_trigger_mode; }
 int ui_get_intra_refresh(void) { return ui_intra_refresh; }
@@ -580,6 +651,7 @@ void ui_save_settings(void) {
     fprintf(f, "# PS3-Moonlight Configuration File\n\n[global]\n");
     fprintf(f, "selected_host=%d\n", selected_host_idx);
     fprintf(f, "fps=%d\n", ui_fps);
+    fprintf(f, "aspect_mode=%d\n", ui_aspect_mode);
     fprintf(f, "bitrate_kbps=%d\n", ui_bitrate_options[ui_bitrate_idx]);
     fprintf(f, "ntsc_rate=%d\n", ui_ntsc_rate);
     fprintf(f, "packet_size_idx=%d\n", ui_packet_size_idx);
@@ -673,7 +745,8 @@ void ui_load_settings(void) {
 
         if (section[0] == '\0' || strcmp(section, "global") == 0) {
             if (strcmp(key, "selected_host") == 0) selected_host_idx = atoi(val);
-            else if (strcmp(key, "fps") == 0) { int v = atoi(val); if (v==30||v==50||v==60||v==120) ui_fps=v; }
+            else if (strcmp(key, "fps") == 0) { int v = atoi(val); if (v==0||v==30||v==50||v==60||v==120) ui_fps=v; }
+            else if (strcmp(key, "aspect_mode") == 0) { int v = atoi(val); if (v==0||v==1) ui_aspect_mode=v; }
             else if (strcmp(key, "bitrate_kbps") == 0) { int v = atoi(val); if (v > 0) ui_bitrate_idx = ui_bitrate_index_for(v); }
             else if (strcmp(key, "bitrate_idx") == 0) {
                 // Pre-kbps config: index into the old ladder.
@@ -999,7 +1072,14 @@ void ui_init(int width, int height) {
     // Load persisted Host IP and stream settings from HDD
     ui_load_settings();
 
-    if (ui_output_is_sd && !ui_res_configured) ui_res_idx = RES_IDX_960;
+    {
+        char out_log[128];
+        snprintf(out_log, sizeof(out_log), "Output: %dx%d %s %s -> AUTO stream %dx%d @ %d fps",
+                 ui_width, ui_height, ui_output_is_4x3() ? "4:3" : "16:9",
+                 ui_output_is_50hz() ? "50Hz" : "60Hz",
+                 ui_get_stream_width(), ui_get_stream_height(), ui_get_fps());
+        ui_push_log(out_log);
+    }
     char cfg_log[96];
     snprintf(cfg_log, sizeof(cfg_log), "Config: Target Host [%s]", target_ip_str);
     ui_push_log(cfg_log);
@@ -1292,7 +1372,7 @@ static void ui_init_fonts() {
 // Settings page: a scrolling list, one row per SR_* id, grouped.
 // ---------------------------------------------------------------------------
 static const char *settings_labels[SETTINGS_ITEM_COUNT] = {
-    "Target FPS:", "Resolution:", "Target Bitrate:", "Decoder Output:", "Decode Speed:",
+    "Target FPS:", "Resolution:", "Picture Shape:", "Target Bitrate:", "Decoder Output:", "Decode Speed:",
     "Presentation:", "Refresh Rate:", "Decoder SPUs:",
     "Packet Size:", "Intra Refresh:", "Virtual Display:", "Quit App On Exit:", "Audio:",
     "Mouse Mode:", "Rumble:", "Triggers:",
@@ -1302,7 +1382,7 @@ static const char *settings_labels[SETTINGS_ITEM_COUNT] = {
 };
 static const char *settings_group_names[] = {"Video Settings", "Network & Host", "Controls", "Display", "Settings"};
 static const unsigned char settings_group[SETTINGS_ITEM_COUNT] = {
-    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0,
     1, 1, 1, 1, 1,
     2, 2, 2,
     3, 3, 3, 3, 3, 3, 3,
@@ -1321,15 +1401,24 @@ static void settings_value_text(int row, char *out, size_t n) {
     switch (row) {
     case SR_FPS: {
         int x100 = ui_get_refresh_x100();
-        if (x100 % 100) snprintf(out, n, "%d.%02d FPS", x100 / 100, x100 % 100);
-        else snprintf(out, n, "%d FPS", ui_fps);
+        char rate[24];
+        if (x100 % 100) snprintf(rate, sizeof(rate), "%d.%02d FPS", x100 / 100, x100 % 100);
+        else snprintf(rate, sizeof(rate), "%d FPS", x100 / 100);
+        if (ui_fps) snprintf(out, n, "%s", rate);
+        else snprintf(out, n, "AUTO (%s, %s output)", rate, ui_output_is_50hz() ? "50 Hz" : "60 Hz");
         break;
     }
     case SR_RES:
-        snprintf(out, n, "%dx%d%s", ui_get_stream_width(), ui_get_stream_height(),
+        snprintf(out, n, "%s%dx%d%s%s", (ui_res_idx == RES_IDX_AUTO) ? "AUTO (" : "",
+                 ui_get_stream_width(), ui_get_stream_height(),
+                 (ui_res_idx == RES_IDX_AUTO) ? ")" : "",
                  (ui_mode_mb_rate() > 522240u) ? "  (OVER Level 4.2)"
                  : (ui_mode_mb_rate() > 245760u) ? "  (needs Level 4.2)"
-                 : (ui_res_idx == RES_IDX_960) ? "  (fastest)" : "");
+                 : (ui_get_stream_width() * 3 == ui_get_stream_height() * 4) ? "  4:3" : "");
+        break;
+    case SR_ASPECT:
+        snprintf(out, n, "%s (%s screen)", ui_aspect_mode ? "STRETCH to fill" : "FIT (black bars)",
+                 ui_output_is_4x3() ? "4:3" : "16:9");
         break;
     case SR_BITRATE: {
         int kbps = ui_bitrate_options[ui_bitrate_idx];
@@ -1395,7 +1484,8 @@ static int settings_change(int row, int dir) {
         ui_fps = ui_fps_options[settings_step(i, dir, NUM_FPS_OPTIONS)];
         return 1;
     }
-    case SR_RES:     ui_res_idx = settings_step(ui_res_idx, dir, NUM_RES_OPTIONS); ui_res_configured = 1; return 1;
+    case SR_RES:     ui_res_idx = settings_step(ui_res_idx, dir, NUM_RES_OPTIONS); return 1;
+    case SR_ASPECT:  ui_aspect_mode = !ui_aspect_mode; return 1;
     case SR_BITRATE: ui_bitrate_idx = settings_step(ui_bitrate_idx, dir, NUM_BITRATE_OPTIONS); return 1;
     case SR_PACKET:  ui_packet_size_idx = settings_step(ui_packet_size_idx, dir, NUM_PACKET_SIZE_OPTIONS); return 1;
     case SR_PIXFMT:  ui_pixfmt = !ui_pixfmt; return 1;
@@ -1462,7 +1552,9 @@ static void ui_loop(void *arg) {
         sysUtilCheckCallback();
         ps3input_get_data(&pad);
         
-        tiny3d_Clear(0x303030ff, TINY3D_CLEAR_ALL);
+        // Black while streaming: it is the colour of the bars round a stream
+        // whose shape does not match the screen.
+        tiny3d_Clear(ui_state == UI_STATE_STREAMING ? 0x000000ff : 0x303030ff, TINY3D_CLEAR_ALL);
         
         // Handle input for UI menu states when OSK dialog is not actively capturing input
         if (ui_state == UI_STATE_IP_ENTRY) {
@@ -1742,11 +1834,11 @@ static void ui_loop(void *arg) {
                 if (kbps % 1000 == 0) {
                     DrawFormatString(SX(60), SY(225), "Current: %dx%d  |  %d FPS  |  %d Mbps  |  Mouse: %s  |  VSync: %s", 
                                      ui_get_stream_width(), ui_get_stream_height(),
-                                     ui_fps, kbps / 1000, (ui_mouse_mode == 0) ? "GAME" : "DESKTOP", ui_vsync ? "ON" : "OFF");
+                                     ui_get_fps(), kbps / 1000, (ui_mouse_mode == 0) ? "GAME" : "DESKTOP", ui_vsync ? "ON" : "OFF");
                 } else {
                     DrawFormatString(SX(60), SY(225), "Current: %dx%d  |  %d FPS  |  %.1f Mbps  |  Mouse: %s  |  VSync: %s", 
                                      ui_get_stream_width(), ui_get_stream_height(),
-                                     ui_fps, (float)kbps / 1000.0f, (ui_mouse_mode == 0) ? "GAME" : "DESKTOP", ui_vsync ? "ON" : "OFF");
+                                     ui_get_fps(), (float)kbps / 1000.0f, (ui_mouse_mode == 0) ? "GAME" : "DESKTOP", ui_vsync ? "ON" : "OFF");
                 }
 
                 // Row 2: Connect / Pair Action Button
