@@ -489,7 +489,11 @@ int main(int argc, char **argv) {
       // Stream Settings so the two can be compared on real hardware.
       streamConfig.packetSize = ui_get_packet_size();
       streamConfig.streamingRemotely = STREAM_CFG_LOCAL;
-      streamConfig.audioConfiguration = AUDIO_CONFIGURATION_STEREO;
+      switch (ui_get_audio_channels()) {
+        case 8:  streamConfig.audioConfiguration = AUDIO_CONFIGURATION_71_SURROUND; break;
+        case 6:  streamConfig.audioConfiguration = AUDIO_CONFIGURATION_51_SURROUND; break;
+        default: streamConfig.audioConfiguration = AUDIO_CONFIGURATION_STEREO; break;
+      }
       streamConfig.supportedVideoFormats = VIDEO_FORMAT_H264;
       memcpy(streamConfig.remoteInputAesKey, rikey_bin, 16);
 

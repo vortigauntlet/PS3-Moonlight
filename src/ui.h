@@ -54,6 +54,7 @@ const char* ui_get_selected_app_name(void);
 const char* ui_get_selected_app_uuid(void);
 int ui_get_virtual_display(void);
 int ui_get_quit_on_exit(void);
+int ui_get_audio_channels(void);
 int ui_get_low_latency(void);
 // Extra line under the error headline (e.g. the host's own rejection reason).
 void ui_set_error_detail(const char *msg);

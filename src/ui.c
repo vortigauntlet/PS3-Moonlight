@@ -205,6 +205,11 @@ static int ui_virtual_display = 1;
 // resumed.  config.ini: quit_on_exit (1 = quit, 0 = leave it running)
 static int ui_quit_on_exit = 1;
 
+// Audio channels requested from the host: 2 (stereo), 6 (5.1) or 8 (7.1).
+// Surround at 15 Mbps and up gets the host's high-quality mode (uncoupled
+// streams at a much higher Opus bitrate).  config.ini: audio_channels
+static int ui_audio_channels = 2;
+
 // Presentation policy (config.ini: low_latency)
 //   0 = smooth:   FIFO up to two deep, trimmed only after ~0.5 s stuck deep
 //   1 = balanced (default): FIFO absorbs a pair that lands in one refresh,
@@ -258,6 +263,7 @@ int ui_get_pixel_format(void)  { return ui_pixfmt; }
 int ui_get_intra_refresh(void) { return ui_intra_refresh; }
 int ui_get_virtual_display(void) { return ui_virtual_display; }
 int ui_get_quit_on_exit(void) { return ui_quit_on_exit; }
+int ui_get_audio_channels(void) { return ui_audio_channels; }
 int ui_get_low_latency(void) { return ui_low_latency; }
 int ui_get_no_deblock(void)    { return ui_no_deblock; }
 int ui_get_vdec_spus(void)     { return ui_vdec_spus; }
@@ -486,6 +492,7 @@ void ui_save_settings(void) {
     fprintf(f, "intra_refresh=%d\n", ui_intra_refresh);
     fprintf(f, "virtual_display=%d\n", ui_virtual_display);
     fprintf(f, "quit_on_exit=%d\n", ui_quit_on_exit);
+    fprintf(f, "audio_channels=%d\n", ui_audio_channels);
     fprintf(f, "low_latency=%d\n", ui_low_latency);
     fprintf(f, "no_deblock=%d\n", ui_no_deblock);
     fprintf(f, "vdec_spus=%d\n", ui_vdec_spus);
@@ -578,6 +585,7 @@ void ui_load_settings(void) {
             else if (strcmp(key, "intra_refresh") == 0) ui_intra_refresh = (atoi(val) != 0);
             else if (strcmp(key, "virtual_display") == 0) ui_virtual_display = (atoi(val) != 0);
             else if (strcmp(key, "quit_on_exit") == 0) ui_quit_on_exit = (atoi(val) != 0);
+            else if (strcmp(key, "audio_channels") == 0) { int v = atoi(val); if (v==2||v==6||v==8) ui_audio_channels=v; }
             else if (strcmp(key, "low_latency") == 0) { int v = atoi(val); if (v >= 0 && v <= 2) ui_low_latency = v; }
             else if (strcmp(key, "no_deblock") == 0) { int v = atoi(val); if (v>=-1&&v<=1) ui_no_deblock=v; }
             else if (strcmp(key, "vdec_spus") == 0) { int v = atoi(val); if (v>=0&&v<=6) ui_vdec_spus=v; }
@@ -1383,7 +1391,7 @@ static void ui_loop(void *arg) {
                 float sy = SY(30);
                 float line_h = SY(20);
                 float hud_w = SX(430);
-                float hud_h = 12.5f * line_h;
+                float hud_h = 13.5f * line_h;
 
                 // Semi-transparent dark HUD container background (#121212 with 85% alpha)
                 tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
@@ -1451,6 +1459,18 @@ static void ui_loop(void *arg) {
                     case 3: spinner = "[ / ]"; break;
                 }
                 DrawFormatString(sx, sy + 11 * line_h, "Stream Link: ACTIVE %s", spinner);
+                {
+                    int ach, ahq;
+                    unsigned adec, amax, aund;
+                    ps3audio_get_hud(&ach, &ahq, &adec, &amax, &aund);
+                    if (ach > 0)
+                        DrawFormatString(sx, sy + 12 * line_h,
+                                         "Audio: %s%s  decode %.2f / %.2f ms  underruns %u",
+                                         ach == 8 ? "7.1" : ach == 6 ? "5.1" : "Stereo",
+                                         ahq ? " HQ" : "", adec / 1000.0f, amax / 1000.0f, aund);
+                    else
+                        DrawString(sx, sy + 12 * line_h, "Audio: not running");
+                }
             }
         } else {
             draw_background_gradient();
