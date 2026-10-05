@@ -46,18 +46,179 @@ static int ip_octets[4] = {192, 168, 1, 1};
 static char target_ip_str[64] = "192.168.1.1";
 
 // Video and stream preferences
+// Frame rate.  50 is here because it is the only rate that can pace 1:1 against
+// a 50 Hz video output, which PAL-region consoles can be set to in the XMB.  On
+// a 60 Hz output it is the WORST of the three: 50 into 60 is an uneven 6:5
+// cadence, whereas 30 is a clean 2:2 and 60 is 1:1.  Check the "output:" line in
+// the log for the refresh rate this console is actually running at.
+//
+// Decode cost at 1080p, in H.264 macroblocks/sec:
+//   30 fps = 244,800  (Level 4.1, and what Yo! Player ships as its 1080p mode)
+//   50 fps = 408,000  (Level 4.2)
+//   60 fps = 489,600  (Level 4.2, and what Yo! Player refuses on this hardware)
+//   120 fps at 720p = 432,000 (Level 4.2).  TEE PS3 Remoteplay measured this as
+//   the LOWEST input delay the console reaches (16.4 ms end to end): every stage
+//   hands over whole pictures, so each waits up to one frame interval, and a
+//   shorter interval shortens every wait.  Above ~120 it stops paying -- the
+//   output is 59.94 Hz, so the extra pictures queue at the flip.
+static int ui_fps_options[] = {30, 50, 60, 120};
+#define NUM_FPS_OPTIONS (int)(sizeof(ui_fps_options) / sizeof(ui_fps_options[0]))
 static int ui_fps = 60;
-static int ui_bitrate_options[] = {2500, 5000, 10000};
+// Bitrate ladder, in kbps.  New steps are APPENDED so a config.ini written by an
+// older build keeps its meaning: index 2 is still 10 Mbps.
+//
+// The upper steps exist to be measured, not because they are all expected to
+// work.  The limit here is the PS3's own receive path, not the LAN, so the
+// honest maximum has to be found on the console: raise the step until the
+// [PS3-NET] log line shows drops climbing or rxq pinned at the socket buffer
+// size, then come back down one.
+//
+// Saved as bitrate_kbps (not an index) so steps can be inserted in order;
+// an old config.ini's bitrate_idx is still read through ui_bitrate_legacy.
+//
+// 12.5 Mbps is there because more bits are not automatically better at 60 fps:
+// TEE PS3 Remoteplay measured ~13 Mbps holding 60 fps in 98% of seconds
+// against 82% at ~20.  The decoder has a per-frame budget and bits spend it.
+// 40 and 50 exist to FIND the PS3's UDP receive ceiling, not because they are
+// expected to hold: watch rx= against the step and fecfail= in [PS3-NET].
+// The request is the step minus 20% (FEC headroom), and Vibepollo's x264
+// with its one-frame VBV has measured at about half of THAT on Cyberpunk.
+static int ui_bitrate_options[] = {2500, 5000, 10000, 12500, 15000, 20000, 25000, 30000, 40000, 50000};
+static const int ui_bitrate_legacy[] = {2500, 5000, 10000, 15000, 20000, 25000, 30000};
 #define NUM_BITRATE_OPTIONS (int)(sizeof(ui_bitrate_options) / sizeof(ui_bitrate_options[0]))
-static int ui_bitrate_idx = 2; // Default: 10 Mbps (Maximum)
+// Default 20 Mbps (index 4).  Higher than Moonlight's reference for either
+// supported mode, deliberately: the PS3's measured receive ceiling on this LAN
+// is 20-25 Mbps, and at 1080p30 that headroom is better spent on picture than
+// left unused.  An existing config.ini keeps whatever index it already had.
+static int ui_bitrate_idx = 5; // 20000
+
+static int ui_bitrate_index_for(int kbps) {
+    int best = 0;
+    for (int i = 1; i < NUM_BITRATE_OPTIONS; i++) {
+        int d = ui_bitrate_options[i] - kbps, b = ui_bitrate_options[best] - kbps;
+        if ((d < 0 ? -d : d) < (b < 0 ? -b : b)) best = i;
+    }
+    return best;
+}
+
+// Ask the host for the console's real output rate, 59.94 Hz, instead of a
+// whole 60.  Anything else beats against the display: 60 on a 59.94 output
+// drops a picture every ~17 s.  Sent as x-nv-video[0].clientRefreshRateX100,
+// which Sunshine/Vibepollo use to run the encoder (and a virtual display) at
+// the fractional rate.  1 = NTSC rates (59.94/29.97/119.88), 0 = whole numbers.
+// config.ini: ntsc_rate
+static int ui_ntsc_rate = 1;
+
+// RTP payload bytes per packet.  1024 was this port's original value; 1392 is
+// Moonlight's standard MTU-safe size and costs 36% fewer recv() syscalls for the
+// same bitrate.
+static int ui_packet_size_options[] = {1024, 1392};
+#define NUM_PACKET_SIZE_OPTIONS (int)(sizeof(ui_packet_size_options) / sizeof(ui_packet_size_options[0]))
+static int ui_packet_size_idx = 0; // Default: 1024, matching earlier builds
+
+// Stream resolution, independent of the FPS selector above, so all four
+// combinations can be tried.  Default stays 720p, which is what every earlier
+// build sent.
+//
+// What each combination asks of the decoder, as H.264 macroblock rate:
+//   720p60  = 3600 MB/frame x 60 = 216000 MB/s  -> inside Level 4.1 (245760)
+//   1080p30 = 8160 MB/frame x 30 = 244800 MB/s  -> just inside Level 4.1
+//   1080p60 = 8160 MB/frame x 60 = 489600 MB/s  -> needs Level 4.2
+// The PS3's decoder advertises Level 4.2 (the Blu-ray maximum), but Blu-ray
+// 1080p is 24 fps, so 1080p60 asks for 2.5x the macroblock rate this hardware
+// has ever been shown to sustain.  It is offered so it can be measured; watch
+// "Decoded FPS" in the stats overlay to see whether it actually keeps up.
+//
+// 1792x1008 (appended, so saved indices keep their meaning) is 16:9 at 7056
+// MB/frame, 13.5% less decode than 1080p for a picture that scales to the TV
+// almost untouched.  TEE PS3 Remoteplay measured it at 60 fps with zero drops.
+static int ui_res_options[][2] = {{1280, 720}, {1920, 1080}, {1792, 1008}};
+#define NUM_RES_OPTIONS (int)(sizeof(ui_res_options) / sizeof(ui_res_options[0]))
+static int ui_res_idx = 0; // Default: 1280x720
+
+// VDEC output pixel format.
+//   0 = ARGB32   - VDEC does the YUV->RGB conversion itself and writes 4 bytes
+//                  per pixel.  This is what every earlier build used.
+//   1 = YUV420P  - VDEC writes 1.5 bytes per pixel and the RSX does the colour
+//                  conversion in tiny3d's built-in YUV shader.  2.67x less data
+//                  crossing main memory per frame, and the conversion moves off
+//                  the decoder's SPUs onto the GPU, where it is close to free.
+//                  This is how JellyFin-PS3 decodes 1080p on the same console.
+// Default stays ARGB because the YUV path has not been run on hardware yet; if
+// it works, it is strictly the better one.
+static int ui_pixfmt = 0;
+
+// Ask Sunshine for periodic intra refresh instead of IDR frames.  On by
+// default: it removes the single largest burst on the wire, which is the
+// dominant packet-loss mechanism at these bitrates.  Sunshine silently ignores
+// the request if its encoder cannot do it.
+//
+// There is no room left on the settings page, so this one lives in config.ini
+// only -- set "intra_refresh=0" in
+// /dev_hdd0/game/MNLT00001/USRDIR/config.ini to turn it off.
+static int ui_intra_refresh = 1;
+
+// Skip the in-loop deblocking filter in the decoder.
+//   -1 = auto (DEFAULT): skip it only on modes that need Level 4.2, i.e.
+//        1080p50/60.  Those ask for ~2.2x the ~220,000 MB/s this console
+//        decodes in practice, so there is no quality A/B to run there --
+//        without every available speedup they cannot play at all.
+//    0 = always keep deblocking (full picture quality)
+//    1 = always skip it (fastest decode, slightly blockier picture)
+//
+// 1080p30 and 720p60 stay at full quality under auto on purpose.  Run 1080p30
+// as-is first; if Decoded FPS sits short of 30, pick FAST and compare -- a
+// clean A/B with one variable, and the quality verdict is the user's to make.
+//
+// Deblocking is the single most expensive stage of H.264 decode -- it is what
+// the IBM Cell research specifically vectorised because it dominated the
+// profile.  cellVdec exposes a pseudo-level (1042, CELL_VDEC_AVC_LEVEL_UNK)
+// that turns it off, typically worth 20-35% of decode time.
+//
+// The cost is drift: the encoder filtered its reference frames and we did not,
+// so our reconstruction slowly diverges. Two things already in this build bound
+// that -- periodic intra refresh continuously re-seeds every macroblock, and
+// maxNumReferenceFrames=1 stops errors propagating down a long chain. At the
+// bitrates this client now targets there is also very little blocking to filter
+// in the first place, which is exactly why trading it for throughput is the
+// right way round: we have bitrate headroom and no decode headroom.
+//
+// config.ini key: no_deblock
+static int ui_no_deblock = -1;
+
+// SPU threads for the decoder. 0 = auto (2 for 720p, 3 for HD as JellyFin-PS3
+// uses, 4 for Level 4.2 modes as Movian uses). Nothing else in this app uses
+// SPUs, and GameOS leaves six available, so 5 is worth a measurement at
+// 1080p60 -- compare dec= in the [PS3-NET] log line. config.ini key: vdec_spus
+static int ui_vdec_spus = 0;
 static int ui_vsync = 1; // Default: VSync ON (1)
+
+// Ask an Apollo/Vibepollo host for a virtual display at the stream mode.
+// Ignored by plain Sunshine (the parameter is never sent to it).  On by
+// default: it is the feature those hosts exist for, and it lets the game run
+// at the PS3's exact resolution and frame rate.  config.ini: virtual_display
+static int ui_virtual_display = 1;
+
+// When the user leaves a stream (exit combo, or quitting to the XMB), also
+// quit the app on the host so it does not keep running with nobody watching.
+// A dropped connection does NOT trigger it, so a network blip can still be
+// resumed.  config.ini: quit_on_exit (1 = quit, 0 = leave it running)
+static int ui_quit_on_exit = 1;
+
+// Presentation policy (config.ini: low_latency)
+//   0 = smooth:   FIFO up to two deep, trimmed only after ~0.5 s stuck deep
+//   1 = balanced (default): FIFO absorbs a pair that lands in one refresh,
+//       but a queue that stays two deep for 6 vblanks loses its oldest
+//   2 = newest:   every vblank shows the newest picture and drops the rest.
+//       Lowest lag, but over Wi-Fi it threw away ~1 in 3 decoded pictures.
+static int ui_low_latency = 1;
 
 // Navigation item counts for Main Menu and Settings Submenu
 #define MAIN_MENU_ITEM_COUNT 3
 static int active_main_item = 0; // 0: Sunshine Host IP, 1: Configure Settings, 2: Connect/Pair
 
-#define SETTINGS_ITEM_COUNT 7
-static int active_settings_item = 0; // 0: FPS, 1: Bitrate, 2: Mouse, 3: VSync, 4: Stats, 5: Verbose, 6: Back
+#define SETTINGS_ITEM_COUNT 11
+static int active_settings_item = 0; // 0: FPS, 1: Resolution, 2: Bitrate, 3: Packet Size, 4: Mouse, 5: VSync, 6: Stats, 7: Verbose, 8: Pixel Format, 9: Decode Speed, 10: Back
 
 static int frames_drawn_this_sec = 0;
 static int ui_fps_actual = 0;
@@ -79,6 +240,27 @@ int ui_get_state() { return ui_state; }
 int ui_is_running() { return ui_running; }
 int ui_get_fps() { return ui_fps; }
 int ui_get_bitrate() { return ui_bitrate_options[ui_bitrate_idx]; }
+int ui_get_refresh_x100(void) {
+    if (ui_ntsc_rate && ui_fps != 50) return (ui_fps * 100000 + 500) / 1001;
+    return ui_fps * 100;
+}
+
+// Macroblock rate of the selected mode, for the level hints in the menu.
+static unsigned int ui_mode_mb_rate(void) {
+    unsigned int w = (unsigned int)(ui_res_options[ui_res_idx][0] + 15) / 16;
+    unsigned int h = (unsigned int)(ui_res_options[ui_res_idx][1] + 15) / 16;
+    return w * h * (unsigned int)ui_fps;
+}
+int ui_get_packet_size() { return ui_packet_size_options[ui_packet_size_idx]; }
+int ui_get_stream_width(void)  { return ui_res_options[ui_res_idx][0]; }
+int ui_get_stream_height(void) { return ui_res_options[ui_res_idx][1]; }
+int ui_get_pixel_format(void)  { return ui_pixfmt; }
+int ui_get_intra_refresh(void) { return ui_intra_refresh; }
+int ui_get_virtual_display(void) { return ui_virtual_display; }
+int ui_get_quit_on_exit(void) { return ui_quit_on_exit; }
+int ui_get_low_latency(void) { return ui_low_latency; }
+int ui_get_no_deblock(void)    { return ui_no_deblock; }
+int ui_get_vdec_spus(void)     { return ui_vdec_spus; }
 int ui_get_width() { return ui_width; }
 int ui_get_height() { return ui_height; }
 void ui_stop() { ui_running = 0; }
@@ -122,6 +304,21 @@ int ui_get_selected_app_id(void) {
         return current_app_list.apps[active_app_idx].id;
     }
     return -1;
+}
+
+const char* ui_get_selected_app_uuid(void) {
+    if (current_app_list.count > 0 && active_app_idx >= 0 && active_app_idx < current_app_list.count) {
+        return current_app_list.apps[active_app_idx].uuid;
+    }
+    return "";
+}
+
+// Error-screen detail line, written by the connect thread, read by the UI.
+static char ui_error_detail[192] = "";
+void ui_set_error_detail(const char *msg) {
+    if (!msg) msg = "";
+    strncpy(ui_error_detail, msg, sizeof(ui_error_detail) - 1);
+    ui_error_detail[sizeof(ui_error_detail) - 1] = '\0';
 }
 
 const char* ui_get_selected_app_name(void) {
@@ -281,7 +478,17 @@ void ui_save_settings(void) {
     fprintf(f, "# PS3-Moonlight Configuration File\n\n[global]\n");
     fprintf(f, "selected_host=%d\n", selected_host_idx);
     fprintf(f, "fps=%d\n", ui_fps);
-    fprintf(f, "bitrate_idx=%d\n", ui_bitrate_idx);
+    fprintf(f, "bitrate_kbps=%d\n", ui_bitrate_options[ui_bitrate_idx]);
+    fprintf(f, "ntsc_rate=%d\n", ui_ntsc_rate);
+    fprintf(f, "packet_size_idx=%d\n", ui_packet_size_idx);
+    fprintf(f, "res_idx=%d\n", ui_res_idx);
+    fprintf(f, "pixfmt=%d\n", ui_pixfmt);
+    fprintf(f, "intra_refresh=%d\n", ui_intra_refresh);
+    fprintf(f, "virtual_display=%d\n", ui_virtual_display);
+    fprintf(f, "quit_on_exit=%d\n", ui_quit_on_exit);
+    fprintf(f, "low_latency=%d\n", ui_low_latency);
+    fprintf(f, "no_deblock=%d\n", ui_no_deblock);
+    fprintf(f, "vdec_spus=%d\n", ui_vdec_spus);
     fprintf(f, "mouse_mode=%d\n", ui_mouse_mode);
     fprintf(f, "vsync=%d\n", ui_vsync ? 1 : 0);
     fprintf(f, "stats=%d\n", show_stats ? 1 : 0);
@@ -356,8 +563,24 @@ void ui_load_settings(void) {
 
         if (section[0] == '\0' || strcmp(section, "global") == 0) {
             if (strcmp(key, "selected_host") == 0) selected_host_idx = atoi(val);
-            else if (strcmp(key, "fps") == 0) { int v = atoi(val); if (v==30||v==60) ui_fps=v; }
-            else if (strcmp(key, "bitrate_idx") == 0) { int v = atoi(val); if (v>=0&&v<NUM_BITRATE_OPTIONS) ui_bitrate_idx=v; }
+            else if (strcmp(key, "fps") == 0) { int v = atoi(val); if (v==30||v==50||v==60||v==120) ui_fps=v; }
+            else if (strcmp(key, "bitrate_kbps") == 0) { int v = atoi(val); if (v > 0) ui_bitrate_idx = ui_bitrate_index_for(v); }
+            else if (strcmp(key, "bitrate_idx") == 0) {
+                // Pre-kbps config: index into the old ladder.
+                int v = atoi(val);
+                if (v >= 0 && v < (int)(sizeof(ui_bitrate_legacy) / sizeof(ui_bitrate_legacy[0])))
+                    ui_bitrate_idx = ui_bitrate_index_for(ui_bitrate_legacy[v]);
+            }
+            else if (strcmp(key, "ntsc_rate") == 0) ui_ntsc_rate = (atoi(val) != 0);
+            else if (strcmp(key, "packet_size_idx") == 0) { int v = atoi(val); if (v>=0&&v<NUM_PACKET_SIZE_OPTIONS) ui_packet_size_idx=v; }
+            else if (strcmp(key, "res_idx") == 0) { int v = atoi(val); if (v>=0&&v<NUM_RES_OPTIONS) ui_res_idx=v; }
+            else if (strcmp(key, "pixfmt") == 0) { int v = atoi(val); if (v==0||v==1) ui_pixfmt=v; }
+            else if (strcmp(key, "intra_refresh") == 0) ui_intra_refresh = (atoi(val) != 0);
+            else if (strcmp(key, "virtual_display") == 0) ui_virtual_display = (atoi(val) != 0);
+            else if (strcmp(key, "quit_on_exit") == 0) ui_quit_on_exit = (atoi(val) != 0);
+            else if (strcmp(key, "low_latency") == 0) { int v = atoi(val); if (v >= 0 && v <= 2) ui_low_latency = v; }
+            else if (strcmp(key, "no_deblock") == 0) { int v = atoi(val); if (v>=-1&&v<=1) ui_no_deblock=v; }
+            else if (strcmp(key, "vdec_spus") == 0) { int v = atoi(val); if (v>=0&&v<=6) ui_vdec_spus=v; }
             else if (strcmp(key, "mouse_mode") == 0) { int v = atoi(val); if (v==0||v==1) ui_mouse_mode=v; }
             else if (strcmp(key, "vsync") == 0) ui_vsync = (atoi(val) != 0);
             else if (strcmp(key, "stats") == 0) show_stats = (atoi(val) != 0);
@@ -993,12 +1216,30 @@ static void ui_loop(void *arg) {
             }
             
             if (active_settings_item == 0) {
-                // Target FPS toggle (30 <-> 60)
-                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
-                    ui_fps = (ui_fps == 30) ? 60 : 30;
+                // Target FPS selection (30 / 50 / 60)
+                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
+                    int i = 0;
+                    for (int k = 0; k < NUM_FPS_OPTIONS; k++) if (ui_fps_options[k] == ui_fps) i = k;
+                    ui_fps = ui_fps_options[(i + 1) % NUM_FPS_OPTIONS];
+                    ui_save_settings();
+                }
+                if (pad.buttons_pressed & LEFT_FLAG) {
+                    int i = 0;
+                    for (int k = 0; k < NUM_FPS_OPTIONS; k++) if (ui_fps_options[k] == ui_fps) i = k;
+                    ui_fps = ui_fps_options[(i + NUM_FPS_OPTIONS - 1) % NUM_FPS_OPTIONS];
                     ui_save_settings();
                 }
             } else if (active_settings_item == 1) {
+                // Stream resolution selection
+                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
+                    ui_res_idx = (ui_res_idx + 1) % NUM_RES_OPTIONS;
+                    ui_save_settings();
+                }
+                if (pad.buttons_pressed & LEFT_FLAG) {
+                    ui_res_idx = (ui_res_idx + NUM_RES_OPTIONS - 1) % NUM_RES_OPTIONS;
+                    ui_save_settings();
+                }
+            } else if (active_settings_item == 2) {
                 // Target Bitrate selection
                 if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     ui_bitrate_idx = (ui_bitrate_idx + 1) % NUM_BITRATE_OPTIONS;
@@ -1008,32 +1249,55 @@ static void ui_loop(void *arg) {
                     ui_bitrate_idx = (ui_bitrate_idx + NUM_BITRATE_OPTIONS - 1) % NUM_BITRATE_OPTIONS;
                     ui_save_settings();
                 }
-            } else if (active_settings_item == 2) {
+            } else if (active_settings_item == 3) {
+                // RTP packet size selection
+                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
+                    ui_packet_size_idx = (ui_packet_size_idx + 1) % NUM_PACKET_SIZE_OPTIONS;
+                    ui_save_settings();
+                }
+                if (pad.buttons_pressed & LEFT_FLAG) {
+                    ui_packet_size_idx = (ui_packet_size_idx + NUM_PACKET_SIZE_OPTIONS - 1) % NUM_PACKET_SIZE_OPTIONS;
+                    ui_save_settings();
+                }
+            } else if (active_settings_item == 4) {
                 // Mouse Mode toggle (0: Game / Relative <-> 1: Desktop / Absolute)
                 if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     ui_mouse_mode = !ui_mouse_mode;
                     ui_save_settings();
                 }
-            } else if (active_settings_item == 3) {
+            } else if (active_settings_item == 5) {
                 // VSync toggle
                 if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     ui_vsync = !ui_vsync;
                     gcmSetFlipMode(ui_vsync ? GCM_FLIP_VSYNC : GCM_FLIP_HSYNC);
                     ui_save_settings();
                 }
-            } else if (active_settings_item == 4) {
+            } else if (active_settings_item == 6) {
                 // Stats overlay toggle
                 if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     show_stats = !show_stats;
                     ui_save_settings();
                 }
-            } else if (active_settings_item == 5) {
+            } else if (active_settings_item == 7) {
                 // Verbose logging toggle
                 if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     ui_verbose = !ui_verbose;
                     ui_save_settings();
                 }
-            } else if (active_settings_item == 6) {
+            } else if (active_settings_item == 8) {
+                // VDEC output pixel format toggle
+                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
+                    ui_pixfmt = !ui_pixfmt;
+                    ui_save_settings();
+                }
+            } else if (active_settings_item == 9) {
+                // Decode speed / deblocking filter
+                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
+                    // AUTO -> QUALITY -> FAST -> AUTO
+                    ui_no_deblock = (ui_no_deblock == 1) ? -1 : ui_no_deblock + 1;
+                    ui_save_settings();
+                }
+            } else if (active_settings_item == 10) {
                 // Back to Main Menu
                 if (pad.buttons_pressed & A_FLAG) {
                     ui_save_settings();
@@ -1118,8 +1382,8 @@ static void ui_loop(void *arg) {
                 float sx = SX(30);
                 float sy = SY(30);
                 float line_h = SY(20);
-                float hud_w = SX(360);
-                float hud_h = 11.5f * line_h;
+                float hud_w = SX(430);
+                float hud_h = 12.5f * line_h;
 
                 // Semi-transparent dark HUD container background (#121212 with 85% alpha)
                 tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
@@ -1156,9 +1420,25 @@ static void ui_loop(void *arg) {
                 DrawFormatString(sx, sy + 4 * line_h, "Render Latency: %d ms", ps3video_get_render_latency());
                 DrawFormatString(sx, sy + 5 * line_h, "Network Latency: %d ms", ps3video_get_net_latency() / 2);
                 DrawFormatString(sx, sy + 6 * line_h, "Total Latency: %d ms", (ps3video_get_net_latency() / 2) + ps3video_get_decode_latency() + ps3video_get_render_latency());
-                DrawFormatString(sx, sy + 7 * line_h, "Resolution: %dx%d", ui_width, ui_height);
+                DrawFormatString(sx, sy + 7 * line_h, "Resolution: %dx%d stream -> %dx%d screen",
+                                 ui_get_stream_width(), ui_get_stream_height(), ui_width, ui_height);
                 DrawFormatString(sx, sy + 8 * line_h, "Target FPS: %d FPS", ui_get_fps());
-                DrawFormatString(sx, sy + 9 * line_h, "Bitrate: %d Mbps", ui_get_bitrate() / 1000);
+                // Requested vs measured.  These two disagreeing is the whole
+                // signal: if "Received" sits below "Bitrate" while frames are
+                // being dropped, the selected step is above what this console
+                // can actually pull.
+                {
+                    extern volatile int ps3_video_rx_kbps;   // VideoStream.c
+                    extern volatile int ps3_video_rxq_bytes; // VideoStream.c
+                    int want = ui_get_bitrate();
+                    int got = ps3_video_rx_kbps;
+
+                    DrawFormatString(sx, sy + 9 * line_h, "Bitrate: %.1f Mbps  (rx %.1f, sock %d KB)",
+                                     (float)want / 1000.0f, (float)got / 1000.0f,
+                                     ps3_video_rxq_bytes / 1024);
+                    DrawFormatString(sx, sy + 10 * line_h, "Dropped frames: %u",
+                                     (unsigned)ps3video_get_dropped_frames());
+                }
                 
                 /* Real-time Hardware Telemetry Stream Link Activity Monitor */
                 u32 total_frames = ps3video_get_total_decoded_frames();
@@ -1170,7 +1450,7 @@ static void ui_loop(void *arg) {
                     case 2: spinner = "[ | ]"; break;
                     case 3: spinner = "[ / ]"; break;
                 }
-                DrawFormatString(sx, sy + 10 * line_h, "Stream Link: ACTIVE %s", spinner);
+                DrawFormatString(sx, sy + 11 * line_h, "Stream Link: ACTIVE %s", spinner);
             }
         } else {
             draw_background_gradient();
@@ -1199,10 +1479,12 @@ static void ui_loop(void *arg) {
                 SetFontColor(0xff9e9e9e, 0);
                 int kbps = ui_bitrate_options[ui_bitrate_idx];
                 if (kbps % 1000 == 0) {
-                    DrawFormatString(SX(60), SY(225), "Current: %d FPS  |  %d Mbps  |  Mouse: %s  |  VSync: %s", 
+                    DrawFormatString(SX(60), SY(225), "Current: %dx%d  |  %d FPS  |  %d Mbps  |  Mouse: %s  |  VSync: %s", 
+                                     ui_get_stream_width(), ui_get_stream_height(),
                                      ui_fps, kbps / 1000, (ui_mouse_mode == 0) ? "GAME" : "DESKTOP", ui_vsync ? "ON" : "OFF");
                 } else {
-                    DrawFormatString(SX(60), SY(225), "Current: %d FPS  |  %.1f Mbps  |  Mouse: %s  |  VSync: %s", 
+                    DrawFormatString(SX(60), SY(225), "Current: %dx%d  |  %d FPS  |  %.1f Mbps  |  Mouse: %s  |  VSync: %s", 
+                                     ui_get_stream_width(), ui_get_stream_height(),
                                      ui_fps, (float)kbps / 1000.0f, (ui_mouse_mode == 0) ? "GAME" : "DESKTOP", ui_vsync ? "ON" : "OFF");
                 }
 
@@ -1227,57 +1509,98 @@ static void ui_loop(void *arg) {
                 DrawString(SX(60), SY(105), "Target FPS:");
                 
                 SetFontColor((active_settings_item == 0) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(105), "[ %d FPS ]", ui_fps);
-
-                // Row 1: Target Bitrate
-                SetFontColor((active_settings_item == 1) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(140), "Target Bitrate:");
-                
-                SetFontColor((active_settings_item == 1) ? 0xff82b1ff : 0xffffffff, 0);
-                int kbps = ui_bitrate_options[ui_bitrate_idx];
-                if (kbps % 1000 == 0) {
-                    DrawFormatString(SX(430), SY(140), "[ %d Mbps ]", kbps / 1000);
-                } else {
-                    DrawFormatString(SX(430), SY(140), "[ %.1f Mbps ]", (float)kbps / 1000.0f);
+                {
+                    int x100 = ui_get_refresh_x100();
+                    if (x100 % 100)
+                        DrawFormatString(SX(430), SY(105), "[ %d.%02d FPS ]", x100 / 100, x100 % 100);
+                    else
+                        DrawFormatString(SX(430), SY(105), "[ %d FPS ]", ui_fps);
                 }
 
-                // Row 2: Mouse Mode
+                // Row 1: Stream Resolution
+                SetFontColor((active_settings_item == 1) ? 0xff82b1ff : 0xffb0bec5, 0);
+                DrawString(SX(60), SY(140), "Resolution:");
+                SetFontColor((active_settings_item == 1) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawFormatString(SX(430), SY(140), "[ %dx%d%s ]",
+                                 ui_get_stream_width(), ui_get_stream_height(),
+                                 (ui_mode_mb_rate() > 522240u) ? "  (OVER Level 4.2)"
+                                 : (ui_mode_mb_rate() > 245760u) ? "  (needs Level 4.2)" : "");
+
+                // Row 2: Target Bitrate
                 SetFontColor((active_settings_item == 2) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(175), "Mouse Mode:");
+                DrawString(SX(60), SY(175), "Target Bitrate:");
                 
                 SetFontColor((active_settings_item == 2) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(175), "[ %s ]", (ui_mouse_mode == 0) ? "GAME (Relative / 3D)" : "DESKTOP (Absolute / 1:1)");
+                int kbps = ui_bitrate_options[ui_bitrate_idx];
+                if (kbps % 1000 == 0) {
+                    DrawFormatString(SX(430), SY(175), "[ %d Mbps ]", kbps / 1000);
+                } else {
+                    DrawFormatString(SX(430), SY(175), "[ %.1f Mbps ]", (float)kbps / 1000.0f);
+                }
 
-                // Row 3: VSync Mode
+                // Row 3: RTP Packet Size
                 SetFontColor((active_settings_item == 3) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(210), "VSync Mode:");
-                
+                DrawString(SX(60), SY(210), "Packet Size:");
                 SetFontColor((active_settings_item == 3) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(210), "[ %s ]", ui_vsync ? "ON (Smooth 60Hz)" : "OFF (Low Latency)");
+                DrawFormatString(SX(430), SY(210), "[ %d bytes - %s ]",
+                                 ui_packet_size_options[ui_packet_size_idx],
+                                 (ui_packet_size_options[ui_packet_size_idx] == 1024)
+                                     ? "original" : "fewer syscalls");
 
-                // Row 4: Stats Overlay
+                // Row 4: Mouse Mode
                 SetFontColor((active_settings_item == 4) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(245), "Stats Overlay:");
+                DrawString(SX(60), SY(245), "Mouse Mode:");
                 
                 SetFontColor((active_settings_item == 4) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(245), "[ %s ]", show_stats ? "ON" : "OFF");
+                DrawFormatString(SX(430), SY(245), "[ %s ]", (ui_mouse_mode == 0) ? "GAME (Relative / 3D)" : "DESKTOP (Absolute / 1:1)");
 
-                // Row 5: Verbose Logging
+                // Row 5: VSync Mode
                 SetFontColor((active_settings_item == 5) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(280), "Verbose Logging:");
+                DrawString(SX(60), SY(280), "VSync Mode:");
                 
                 SetFontColor((active_settings_item == 5) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(280), "[ %s ]", ui_verbose ? "ON" : "OFF");
+                DrawFormatString(SX(430), SY(280), "[ %s ]", ui_vsync ? "ON (Smooth 60Hz)" : "OFF (Low Latency)");
 
-                // Row 6: Back to Main Menu Button
-                SetFontSize(SF(22), SF(22));
+                // Row 6: Stats Overlay
+                SetFontColor((active_settings_item == 6) ? 0xff82b1ff : 0xffb0bec5, 0);
+                DrawString(SX(60), SY(315), "Stats Overlay:");
+                
                 SetFontColor((active_settings_item == 6) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawString(SX(60), SY(330), "[ BACK TO MAIN MENU ]");
+                DrawFormatString(SX(430), SY(315), "[ %s ]", show_stats ? "ON" : "OFF");
+
+                // Row 7: Verbose Logging
+                SetFontColor((active_settings_item == 7) ? 0xff82b1ff : 0xffb0bec5, 0);
+                DrawString(SX(60), SY(350), "Verbose Logging:");
+                
+                SetFontColor((active_settings_item == 7) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawFormatString(SX(430), SY(350), "[ %s ]", ui_verbose ? "ON" : "OFF");
+
+                // Row 8: VDEC Output Pixel Format
+                SetFontColor((active_settings_item == 8) ? 0xff82b1ff : 0xffb0bec5, 0);
+                DrawString(SX(60), SY(385), "Decoder Output:");
+                SetFontColor((active_settings_item == 8) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawFormatString(SX(430), SY(385), "[ %s ]",
+                                 ui_pixfmt ? "YUV420 (GPU convert, faster)"
+                                           : "ARGB32 (original)");
+
+                // Row 9: Decode Speed (deblocking filter)
+                SetFontColor((active_settings_item == 9) ? 0xff82b1ff : 0xffb0bec5, 0);
+                DrawString(SX(60), SY(420), "Decode Speed:");
+                SetFontColor((active_settings_item == 9) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawFormatString(SX(430), SY(420), "[ %s ]",
+                                 (ui_no_deblock == 1) ? "FAST (no deblocking)"
+                                 : (ui_no_deblock == 0) ? "QUALITY (normal)"
+                                                        : "AUTO (fast at 1080p50/60)");
+
+                // Row 10: Back to Main Menu Button
+                SetFontSize(SF(22), SF(22));
+                SetFontColor((active_settings_item == 10) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawString(SX(60), SY(455), "[ BACK TO MAIN MENU ]");
 
                 // Clean controls legend
                 SetFontSize(SF(18), SF(18));
                 SetFontColor(0xff9e9e9e, 0);
-                DrawString(SX(60), SY(445), "\x05 Navigate   |   \x01 Select / Change   |   \x02 Back");
+                DrawString(SX(60), SY(490), "\x05 Navigate   |   \x01 Select / Change   |   \x02 Back");
             } else if (ui_state == UI_STATE_PAIRING) {
                 // Title inside #3F51B5 header bar
                 SetFontSize(SF(26), SF(26));
@@ -1454,8 +1777,39 @@ static void ui_loop(void *arg) {
                 SetFontSize(SF(26), SF(26));
                 SetFontColor(0xffff5252, 0);
                 DrawString(SX(60), SY(200), "ERROR: Target unreachable or Pairing failed.");
-                DrawString(SX(60), SY(260), "Press \x01 to return.");
-                if (pad.buttons_pressed & A_FLAG) ui_state = UI_STATE_IP_ENTRY;
+                if (ui_error_detail[0]) {
+                    // The host's own reason (Vibepollo explains permission
+                    // refusals and what to change).  Wrapped by hand: the font
+                    // layer does not wrap.
+                    SetFontSize(SF(18), SF(18));
+                    SetFontColor(0xffffffff, 0);
+                    const int wrap = 70;
+                    const char *p = ui_error_detail;
+                    int line = 0;
+                    while (*p && line < 4) {
+                        char buf[80];
+                        int len = (int)strlen(p);
+                        int take = len > wrap ? wrap : len;
+                        if (take < len) {
+                            int sp = take;
+                            while (sp > 0 && p[sp] != ' ') sp--;
+                            if (sp > 0) take = sp;
+                        }
+                        memcpy(buf, p, (size_t)take);
+                        buf[take] = '\0';
+                        DrawString(SX(60), SY(235 + line * 24), buf);
+                        p += take;
+                        while (*p == ' ') p++;
+                        line++;
+                    }
+                    SetFontSize(SF(26), SF(26));
+                    SetFontColor(0xffff5252, 0);
+                }
+                DrawString(SX(60), SY(340), "Press \x01 to return.");
+                if (pad.buttons_pressed & A_FLAG) {
+                    ui_state = UI_STATE_IP_ENTRY;
+                    ui_error_detail[0] = '\0';
+                }
             }
         }
 
@@ -1503,6 +1857,7 @@ static void ui_loop(void *arg) {
         }
 
         tiny3d_Flip();
+        ps3video_after_flip(); // YUV self-test screen capture (no-op unless armed)
         // tiny3d_Flip() waits for VBlank, so usleep is unnecessary and causes frame drops.
     }
     sysThreadExit(0);

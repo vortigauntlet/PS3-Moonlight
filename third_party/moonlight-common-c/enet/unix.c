@@ -1,3 +1,15 @@
+#include <errno.h>
+#ifdef __PPU__
+/* PS3 libnet returns ENOBUFS (105) when its small shared buffer pool (128 KB
+ * for every socket) is momentarily exhausted -- seen at ~24 Mbps sustained,
+ * where ALL sockets failed with 105 in the same instant and the stream was
+ * torn down.  It is transient: treat it like EWOULDBLOCK / a poll timeout and
+ * let ENet retry, instead of failing the connection. */
+#include <unistd.h>
+#define ENET_PS3_ENOBUFS_RETRY || errno == ENOBUFS
+#else
+#define ENET_PS3_ENOBUFS_RETRY
+#endif
 /**
  @file  unix.c
  @brief ENet Unix system specific functions
@@ -634,6 +646,11 @@ enet_socket_send (ENetSocket socket,
         (struct sockaddr *) & peerAddress -> address, peerAddress -> addressLength);
 
 #ifdef __PPU__
+    /* Save errno NOW: the debug printf and free() below can overwrite it, and
+     * then the ENOBUFS case in the switch further down never matched -- a
+     * momentary pool shortage was reported as a fatal send error and the
+     * stream was torn down ("Failed to send ENet control packet ... 105"). */
+    int sendErrno = errno;
     if (sentLength < 0) {
         struct sockaddr_in *sin = (struct sockaddr_in *)&peerAddress->address;
         printf("[ENET-DBG] sendto failed: errno=%d sock=%d len=%u addrlen=%d family=%d port=%d\n",
@@ -643,6 +660,9 @@ enet_socket_send (ENetSocket socket,
 #endif
     if (bufferCount > 1)
       free(sendBuffer);
+#ifdef __PPU__
+    errno = sendErrno;
+#endif
 #else
     struct msghdr msgHdr;
     char controlBufData[1024];
@@ -722,6 +742,12 @@ enet_socket_send (ENetSocket socket,
         case EWOULDBLOCK:
             return 0;
 
+#ifdef __PPU__
+        // libnet's shared pool momentarily exhausted (see top of file).
+        case ENOBUFS:
+            return 0;
+#endif
+
         // These errors are treated as possible transient
         // conditions that could be caused by a network
         // interruption. We'll ignore them and allow the
@@ -780,7 +806,7 @@ enet_socket_receive (ENetSocket socket,
 
     if (recvLength == -1)
     {
-       if (errno == EWOULDBLOCK)
+       if (errno == EWOULDBLOCK ENET_PS3_ENOBUFS_RETRY)
          return 0;
 
        return -1;
@@ -808,7 +834,7 @@ enet_socket_receive (ENetSocket socket,
 
     if (recvLength == -1)
     {
-       if (errno == EWOULDBLOCK)
+       if (errno == EWOULDBLOCK ENET_PS3_ENOBUFS_RETRY)
          return 0;
 
        return -1;
@@ -923,6 +949,13 @@ enet_socket_wait (ENetSocket socket, enet_uint32 * condition, enet_uint32 timeou
     if (pollCount < 0)
     {
 #ifdef __PPU__
+        if (errno == ENOBUFS) {
+            /* Pool exhausted for a moment: report "nothing ready" and let
+             * the caller come round again. */
+            usleep(1000);
+            * condition = ENET_SOCKET_WAIT_NONE;
+            return 0;
+        }
         printf("[ENET-DBG] poll failed: errno=%d sock=%d events=0x%x timeout=%u\n",
             errno, (int)socket, (int)pollSocket.events, (unsigned)timeout);
 #endif

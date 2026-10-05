@@ -22,6 +22,14 @@ int ui_get_state();
 int ui_is_running();
 int ui_get_fps();
 int ui_get_bitrate();
+int ui_get_refresh_x100(void); // 5994 for 59.94 fps
+int ui_get_packet_size();
+int ui_get_stream_width(void);
+int ui_get_stream_height(void);
+int ui_get_pixel_format(void);
+int ui_get_intra_refresh(void);
+int ui_get_no_deblock(void);
+int ui_get_vdec_spus(void);
 const char* ui_get_target_ip();
 int ui_get_width();
 int ui_get_height();
@@ -43,6 +51,12 @@ const char* ui_get_pairing_pin(void);
 void ui_set_app_list(const ps3_app_list_t *list);
 int ui_get_selected_app_id(void);
 const char* ui_get_selected_app_name(void);
+const char* ui_get_selected_app_uuid(void);
+int ui_get_virtual_display(void);
+int ui_get_quit_on_exit(void);
+int ui_get_low_latency(void);
+// Extra line under the error headline (e.g. the host's own rejection reason).
+void ui_set_error_detail(const char *msg);
 int ui_is_app_selected(void);
 void ui_reset_app_selection(void);
 

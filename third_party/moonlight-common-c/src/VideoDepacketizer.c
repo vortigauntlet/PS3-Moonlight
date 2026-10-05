@@ -66,7 +66,23 @@ void initializeVideoDepacketizer(int pktSize) {
     // provides ~2 seconds of buffer at 60fps.  On other platforms a small
     // queue is fine because software decoders are consistently fast.
 #ifdef __PPU__
-    LbqInitializeLinkedBlockingQueue(&decodeUnitQueue, 120);
+    // 120 was chosen as "~2 seconds at 60fps".  The unit is wrong: it is a FRAME
+    // COUNT, so at 30 fps the same 120 is FOUR seconds, and every frame queued
+    // here is a frame of input latency the player can feel.  Worse at 1080p,
+    // where each queued unit also holds ~100 KB of compressed data, so a full
+    // queue is ~12 MB on top of the frame buffers and VDEC's working set.
+    //
+    // Express the intent instead: about two seconds, whatever the frame rate.
+    // (Same class of mistake as sizing an audio queue in fixed-size slots when
+    // the packets are a third of a slot -- the limit has to be in the unit that
+    // actually runs out.)
+    //
+    // Revised 2026-10-03: two seconds was the wrong intent for a game stream.
+    // When arrival and decode run at the same rate, a backlog that builds up
+    // in a hiccup NEVER drains -- it becomes permanent input lag.  Back to
+    // upstream's 15 units; overflow flushes the queue and asks for an IDR, so
+    // the stream recovers to "now" instead of staying behind.
+    LbqInitializeLinkedBlockingQueue(&decodeUnitQueue, 15);
 #else
     LbqInitializeLinkedBlockingQueue(&decodeUnitQueue, 15);
 #endif
@@ -1201,3 +1217,10 @@ void queueRtpPacket(PRTPV_QUEUE_ENTRY queueEntryPtr) {
 int LiGetPendingVideoFrames(void) {
     return LbqGetItemCount(&decodeUnitQueue);
 }
+
+#ifdef __PPU__
+// Decode units waiting for the decoder thread, for the [PS3-NET] log line.
+int ps3_decode_queue_depth(void) {
+    return LbqGetItemCount(&decodeUnitQueue);
+}
+#endif

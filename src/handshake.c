@@ -24,6 +24,8 @@
 #include "net_logger.h"
 #include "handshake.h"
 #include "ui.h"
+#include <lv2/systime.h>
+#include "ui.h"
 #include "random.h"
 #include <net/poll.h>
 
@@ -381,7 +383,13 @@ cleanup:
 
 // Plain HTTP request (no SSL) for initial pairing steps
 // Sunshine's /pair endpoint is also available on plain HTTP port 47989
-static int ps3_http_request(handshake_info_t *info, const char *url_path, struct string *response) {
+// wait_secs > 0: the request is one the host deliberately holds open (pairing
+// step 1 waits until the PIN is typed into the host's web UI).  Each recv()
+// then times out after 1 s so the loop can notice a cancel from the UI, and
+// the whole wait is bounded by wait_secs.  wait_secs == 0 keeps the old flat
+// 30 s socket timeout.
+static int ps3_http_request_ex(handshake_info_t *info, const char *url_path,
+                               struct string *response, int wait_secs) {
     int fd = -1;
     struct sockaddr_in serv_addr;
     char request[4096];
@@ -409,8 +417,9 @@ static int ps3_http_request(handshake_info_t *info, const char *url_path, struct
     struct timeval tv;
     tv.tv_sec = 30;
     tv.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (wait_secs > 0) tv.tv_sec = 1;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     if (connect_with_cancel(fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
         NLOG("[HTTP] connect failed: %d", errno);
@@ -441,9 +450,30 @@ static int ps3_http_request(handshake_info_t *info, const char *url_path, struct
         written += (size_t)ret;
     }
 
+    u64 wait_start = sysGetSystemTime();
     while (1) {
+        u64 t0 = sysGetSystemTime();
         ret = recv(fd, buf, sizeof(buf) - 1, 0);
-        if (ret <= 0) break;
+        if (ret == 0) break;
+        if (ret < 0) {
+            // A held-open request: an empty 1 s recv timeout is not an error.
+            // Told apart from a real failure by how long the call took, which
+            // does not depend on what errno this libc reports for a timeout.
+            u64 now = sysGetSystemTime();
+            int timed_out = (now - t0) >= 900000ULL;
+            if (wait_secs > 0 && timed_out && response->len == 0 &&
+                (now - wait_start) < (u64)wait_secs * 1000000ULL &&
+                ui_get_state() == UI_STATE_PAIRING) {
+                continue;
+            }
+            if (wait_secs > 0) {
+                NLOG("[HTTP] gave up after %u s (%s)",
+                     (unsigned)((now - wait_start) / 1000000ULL),
+                     ui_get_state() != UI_STATE_PAIRING ? "cancelled" :
+                     timed_out ? "no PIN entered in time" : "connection error");
+            }
+            break;
+        }
         if (append_string(response, buf, (size_t)ret) != 0) {
             NLOG("[HTTP] response is too large or memory allocation failed");
             close(fd);
@@ -454,12 +484,17 @@ static int ps3_http_request(handshake_info_t *info, const char *url_path, struct
 
     close(fd);
     if (!http_response_ok(response)) {
-        NLOG("[HTTP] server returned an invalid or unsuccessful response");
+        NLOG("[HTTP] server returned an invalid or unsuccessful response (%zu bytes): %.300s",
+             response->len, response->ptr ? response->ptr : "");
         reset_string(response);
         return -1;
     }
     NLOG("[HTTP] Response (%zu bytes)", response->len);
     return 0;
+}
+
+static int ps3_http_request(handshake_info_t *info, const char *url_path, struct string *response) {
+    return ps3_http_request_ex(info, url_path, response, 0);
 }
 
 int hv_generate_credentials(handshake_info_t *info) {
@@ -682,6 +717,78 @@ static char* extract_xml(const char *xml, const char *tag) {
     return res;
 }
 
+// Record the host's status_message when it rejects a request.  Sunshine and
+// its forks answer errors as <root status_code="403" status_message="...">.
+static void capture_status(handshake_info_t *info, const char *xml) {
+    if (!info || !xml) return;
+    const char *code = strstr(xml, "status_code=\"");
+    if (code && strncmp(code + 13, "200\"", 4) == 0) return;
+    const char *msg = strstr(xml, "status_message=\"");
+    if (!msg) return;
+    msg += 16;
+    const char *end = strchr(msg, '"');
+    if (!end) return;
+    size_t len = (size_t)(end - msg);
+    if (len >= sizeof(info->last_status)) len = sizeof(info->last_status) - 1;
+    memcpy(info->last_status, msg, len);
+    info->last_status[len] = '\0';
+    // The XML escapes quotes inside the attribute; show them as quotes.
+    char *q;
+    while ((q = strstr(info->last_status, "&quot;")) != NULL) {
+        *q = '\'';
+        memmove(q + 1, q + 6, strlen(q + 6) + 1);
+    }
+    NLOG("host status: %s", info->last_status);
+}
+
+// Apollo/Vibepollo advertise extra fields in the HTTPS /serverinfo.  Their
+// presence is the only reliable way to tell the family apart: the appversion
+// string is Sunshine's own.
+static void parse_host_caps(handshake_info_t *info, const char *xml) {
+    if (!info || !xml) return;
+    char *vd = extract_xml(xml, "VirtualDisplayCapable");
+    if (vd) {
+        info->is_apollo = 1;
+        info->vd_capable = (strcmp(vd, "true") == 0 || strcmp(vd, "1") == 0);
+        free(vd);
+    }
+    char *perm = extract_xml(xml, "Permission");
+    if (perm) {
+        info->has_perm = 1;
+        info->perm = (unsigned int)strtoul(perm, NULL, 10);
+        free(perm);
+    }
+    if (info->is_apollo || info->has_perm) {
+        NLOG("host: Apollo/Vibepollo family, virtual display=%s, perm=%s0x%08x",
+             info->vd_capable ? "yes" : "no",
+             info->has_perm ? "" : "(none) ", info->perm);
+    }
+}
+
+int hv_missing_permissions(const handshake_info_t *info, char *out, size_t out_size) {
+    if (!info || !out || out_size == 0) return 0;
+    out[0] = '\0';
+    if (!info->has_perm) return 0;
+    static const struct { unsigned int bit; const char *name; } need[] = {
+        { HV_PERM_LAUNCH,           "Launch" },
+        { HV_PERM_VIEW,             "View" },
+        { HV_PERM_INPUT_CONTROLLER, "Controller" },
+        { HV_PERM_INPUT_MOUSE,      "Mouse" },
+        { HV_PERM_INPUT_KBD,        "Keyboard" },
+    };
+    int missing = 0;
+    size_t used = 0;
+    for (size_t i = 0; i < sizeof(need) / sizeof(need[0]); i++) {
+        if (info->perm & need[i].bit) continue;
+        int n = snprintf(out + used, out_size - used, "%s%s",
+                         missing ? ", " : "", need[i].name);
+        if (n < 0 || (size_t)n >= out_size - used) break;
+        used += (size_t)n;
+        missing++;
+    }
+    return missing;
+}
+
 int hv_is_paired(handshake_info_t *info) {
     char path[512];
     struct string s = {0};
@@ -694,6 +801,8 @@ int hv_is_paired(handshake_info_t *info) {
         NLOG("hv_is_paired: HTTPS handshake failed or rejected (not paired)");
         return 0;
     }
+
+    parse_host_caps(info, s.ptr);
 
     char *paired_val = extract_xml(s.ptr, "PairStatus");
     if (!paired_val) paired_val = extract_xml(s.ptr, "paired");
@@ -709,7 +818,7 @@ int hv_is_paired(handshake_info_t *info) {
     return paired;
 }
 
-int hv_pair(handshake_info_t *info, const char *pin) {
+int hv_pair(handshake_info_t *info, const char *pin, const char *otp_passphrase) {
     char path[8192];
     struct string s;
     init_string(&s);
@@ -721,7 +830,12 @@ int hv_pair(handshake_info_t *info, const char *pin) {
         return -1;
     }
 
-    NLOG("Starting pairing. Enter PIN %s on the host.", pin);
+    int use_otp = (otp_passphrase && otp_passphrase[0]);
+    if (use_otp) {
+        NLOG("Starting OTP pairing with the host-issued PIN.");
+    } else {
+        NLOG("Starting pairing. Enter PIN %s on the host.", pin);
+    }
 
     // --- Generate random uuid (vita does this per-request, we'll use one for all HTTP steps)
     char uuid_str[40];
@@ -782,12 +896,38 @@ int hv_pair(handshake_info_t *info, const char *pin) {
         return -1;
     }
 
+    // Apollo/Vibepollo OTP: prove knowledge of the host-issued PIN and
+    // passphrase without sending either.  The host checks
+    //   util::hex(sha256(pin + salt + passphrase), true)
+    // i.e. UPPERCASE hex in byte order, over the salt exactly as sent in salt=.
+    char otp_hex[65];
+    otp_hex[0] = '\0';
+    if (use_otp) {
+        char otp_in[4 + 32 + 128 + 1];
+        int n = snprintf(otp_in, sizeof(otp_in), "%s%s%s", pin, salt_hex, otp_passphrase);
+        if (n < 0 || (size_t)n >= sizeof(otp_in)) {
+            NLOG("OTP passphrase too long");
+            x509_crt_free(&client_cert);
+            pk_free(&key); entropy_free(&entropy); ctr_drbg_free(&ctr_drbg);
+            return -1;
+        }
+        unsigned char otp_hash[32];
+        sha256((const unsigned char *)otp_in, (size_t)n, otp_hash, 0);
+        bin_to_hex(otp_hash, 32, otp_hex);
+        memset(otp_in, 0, sizeof(otp_in));
+    }
+
     // STEP 1: getservercert (HTTP)
     snprintf(path, sizeof(path),
-        "/pair?uniqueid=%s&uuid=%s&devicename=PS3&updateState=1&phrase=getservercert&salt=%s&clientcert=%s",
-        info->unique_id, uuid_str, salt_hex, cert_hex);
+        "/pair?uniqueid=%s&uuid=%s&devicename=PS3&updateState=1&phrase=getservercert&salt=%s&clientcert=%s%s%s",
+        info->unique_id, uuid_str, salt_hex, cert_hex,
+        use_otp ? "&otpauth=" : "", otp_hex);
 
-    if (ps3_http_request(info, path, &s) != 0) {
+    // The host answers this only once the PIN is entered in its web UI, and
+    // keeps the request for 10 minutes (Vibepollo nvhttp.cpp
+    // pairing_session_expiry).  The old flat 30 s timeout failed every pairing
+    // where the PIN took longer than that to type.  OTP pairing answers at once.
+    if (ps3_http_request_ex(info, path, &s, use_otp ? 0 : 600) != 0) {
         NLOG("Step 1: HTTP request failed");
         goto fail;
     }
@@ -797,6 +937,7 @@ int hv_pair(handshake_info_t *info, const char *pin) {
         char *paired_val = extract_xml(s.ptr, "paired");
         if (!paired_val || strcmp(paired_val, "1") != 0) {
             NLOG("Step 1: server did not return paired=1 (response: %.500s)", s.ptr ? s.ptr : "empty");
+            capture_status(info, s.ptr);
             free(paired_val);
             goto fail;
         }
@@ -1146,6 +1287,7 @@ int hv_get_app_list(handshake_info_t *info, ps3_app_list_t *list) {
         return -1;
     }
     NLOG("Applist response: %.600s", s.ptr);
+    capture_status(info, s.ptr);
 
     const char *curr = s.ptr;
     while (curr && list->count < MAX_APP_ENTRIES) {
@@ -1168,16 +1310,26 @@ int hv_get_app_list(handshake_info_t *info, ps3_app_list_t *list) {
 
             char *id_str = extract_xml(block, "ID");
             if (!id_str) id_str = extract_xml(block, "id");
+            // Apollo/Vibepollo: apps carry a stable UUID.  Numeric IDs are
+            // re-derived by the host (Vibepollo keeps an alias table for them),
+            // so the UUID is the identity worth launching by.
+            char *uuid = extract_xml(block, "UUID");
 
             if (title && id_str) {
                 list->apps[list->count].id = atoi(id_str);
                 strncpy(list->apps[list->count].name, title, sizeof(list->apps[list->count].name) - 1);
                 list->apps[list->count].name[sizeof(list->apps[list->count].name) - 1] = '\0';
-                NLOG("Found App [%d]: %s (ID: %d)", list->count, list->apps[list->count].name, list->apps[list->count].id);
+                if (uuid) {
+                    strncpy(list->apps[list->count].uuid, uuid, sizeof(list->apps[list->count].uuid) - 1);
+                    list->apps[list->count].uuid[sizeof(list->apps[list->count].uuid) - 1] = '\0';
+                }
+                NLOG("Found App [%d]: %s (ID: %d%s%s)", list->count, list->apps[list->count].name,
+                     list->apps[list->count].id, uuid ? ", UUID: " : "", uuid ? uuid : "");
                 list->count++;
             }
             if (title) free(title);
             if (id_str) free(id_str);
+            if (uuid) free(uuid);
             free(block);
         }
         curr = app_end + 6;
@@ -1217,18 +1369,57 @@ int hv_get_first_appid(handshake_info_t *info) {
 static int build_launch_params(char *path, size_t pathsz,
                                const char *verb,
                                handshake_info_t *info, int app_id,
+                               const char *app_uuid, int virtual_display,
                                const char *rikey, int rikeyid) {
     char uuid_str[40];
     if (generate_uuid_string(uuid_str) != 0) return -1;
 
+    // mode= is what the host uses to configure the game itself (sops=1), so it
+    // has to follow the picker.  Leaving this at 1280x720x60 pinned the game to
+    // 720p no matter what the RTSP SDP asked the encoder for.
+    //
+    // The refresh part is fractional (e.g. 1920x1080x59.94) for Apollo-family
+    // hosts.  Vibepollo creates its virtual display AT this mode, and its
+    // parser takes up to three decimals.  A whole 60 here gives a 60 Hz
+    // display that the encoder (running at 59.94 from clientRefreshRateX100)
+    // must sample, so the host itself repeats a frame every ~17 s -- the same
+    // beat the 59.94 request exists to remove, just moved to the PC.  Plain
+    // Sunshine gets the integer form it has always had.
+    char refresh[16];
+    int x100 = ui_get_refresh_x100();
+    if (info->is_apollo && (x100 % 100) != 0) {
+        snprintf(refresh, sizeof(refresh), "%d.%02d", x100 / 100, x100 % 100);
+    } else {
+        snprintf(refresh, sizeof(refresh), "%d", ui_get_fps());
+    }
     int length = snprintf(path, pathsz,
-        "/%s?uniqueid=%s&uuid=%s&appid=%d&mode=1280x720x60"
+        "/%s?uniqueid=%s&uuid=%s&appid=%d&mode=%dx%dx%s"
         "&additionalStates=1&sops=1"
         "&rikey=%s&rikeyid=%d"
         "&localAudioPlayMode=0&surroundAudioInfo=196610"
         "&remoteControllersBitmap=1&gcmap=1&corever=1",
-        verb, info->unique_id, uuid_str, app_id, rikey, rikeyid);
-    return length >= 0 && (size_t)length < pathsz ? 0 : -1;
+        verb, info->unique_id, uuid_str, app_id,
+        ui_get_stream_width(), ui_get_stream_height(), refresh,
+        rikey, rikeyid);
+    if (length < 0 || (size_t)length >= pathsz) return -1;
+
+    // Apollo/Vibepollo extensions.  Only sent to a host that advertised them,
+    // so plain Sunshine sees the exact request it always did.
+    //   appuuid        - launch by the app's stable identity
+    //   virtualDisplay - host creates a display AT mode=, so the game renders
+    //                    at exactly the PS3's resolution and refresh (1080p30
+    //                    gets a real 30 Hz display rather than a 60 Hz desktop
+    //                    being sampled every other frame)
+    //   clientName     - how the session is labelled in the host's UI
+    if (info->is_apollo) {
+        int more = snprintf(path + length, pathsz - (size_t)length,
+            "%s%s&virtualDisplay=%d&clientName=PS3",
+            (app_uuid && app_uuid[0]) ? "&appuuid=" : "",
+            (app_uuid && app_uuid[0]) ? app_uuid : "",
+            (virtual_display && info->vd_capable) ? 1 : 0);
+        if (more < 0 || (size_t)more >= pathsz - (size_t)length) return -1;
+    }
+    return 0;
 }
 
 // Send /cancel to end any existing session
@@ -1243,6 +1434,30 @@ static void hv_cancel(handshake_info_t *info) {
         NLOG("Cancel response: %.200s", s.ptr ? s.ptr : "");
     }
     free(s.ptr);
+}
+
+// End the host-side session: stops the app and, on Apollo/Vibepollo, removes
+// the virtual display.  Without this, leaving a stream only drops the
+// connection and the host keeps everything running for a resume.
+int hv_quit_app(handshake_info_t *info) {
+    char path[512];
+    struct string s = {0};
+    char uuid_str[40];
+    if (!info || generate_uuid_string(uuid_str) != 0) return -1;
+    snprintf(path, sizeof(path), "/cancel?uniqueid=%s&uuid=%s", info->unique_id, uuid_str);
+    NLOG("Quitting the app on the host (/cancel)...");
+    int ok = 0;
+    if (ps3_https_request(info, path, &s) == 0 && s.ptr) {
+        char *cv = extract_xml(s.ptr, "cancel");
+        ok = cv && atoi(cv) == 1;
+        free(cv);
+        if (!ok) capture_status(info, s.ptr);
+        NLOG("Quit response: %s", ok ? "app closed on host" : "host did not confirm");
+    } else {
+        NLOG("Quit request failed (host unreachable?)");
+    }
+    free(s.ptr);
+    return ok ? 0 : -1;
 }
 
 // Parse session URL from response and store in info
@@ -1260,12 +1475,14 @@ static void parse_session_url(handshake_info_t *info, const char *response) {
     }
 }
 
-int hv_launch(handshake_info_t *info, int app_id, const char *rikey, int rikeyid) {
+int hv_launch(handshake_info_t *info, int app_id, const char *app_uuid,
+              int virtual_display, const char *rikey, int rikeyid) {
     char path[4096];
     struct string s = {0};
 
     // --- Try /resume first (handles "already running" sessions)
-    if (build_launch_params(path, sizeof(path), "resume", info, app_id, rikey, rikeyid) != 0)
+    if (build_launch_params(path, sizeof(path), "resume", info, app_id, app_uuid,
+                            virtual_display, rikey, rikeyid) != 0)
         return -1;
     NLOG("Trying to resume the existing session");
     if (ps3_https_request(info, path, &s) == 0 && s.ptr) {
@@ -1293,7 +1510,8 @@ int hv_launch(handshake_info_t *info, int app_id, const char *rikey, int rikeyid
     sleep(1);
 
     // --- Try fresh /launch
-    if (build_launch_params(path, sizeof(path), "launch", info, app_id, rikey, rikeyid) != 0)
+    if (build_launch_params(path, sizeof(path), "launch", info, app_id, app_uuid,
+                            virtual_display, rikey, rikeyid) != 0)
         return -1;
     NLOG("Sending launch request");
     reset_string(&s);
@@ -1311,6 +1529,7 @@ int hv_launch(handshake_info_t *info, int app_id, const char *rikey, int rikeyid
     free(gsv);
     if (gamesession == 0) {
         NLOG("Launch failed: gamesession=0 (Sunshine rejected launch)");
+        capture_status(info, s.ptr);
         free(s.ptr);
         return -1;
     }

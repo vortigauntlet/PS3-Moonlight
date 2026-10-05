@@ -302,6 +302,30 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         snprintf(payloadStr, sizeof(payloadStr), "%u", EncryptionFeaturesEnabled);
         err |= addAttributeString(&optionHead, "x-ss-general.encryptionEnabled", payloadStr);
 
+#ifdef __PPU__
+        // Periodic intra refresh, if the client asked for it.
+        //
+        // Without this, Sunshine periodically sends a full IDR frame, which on
+        // the wire is a single burst roughly 4x the size of an average frame --
+        // ~406 KB at 1080p30 and 20 Mbps.  That burst is the thing the socket
+        // receive buffer has to be sized around, and a dropped packet triggers
+        // another IDR at exactly the moment the link is already struggling,
+        // which is how an IDR storm starts.
+        //
+        // Intra refresh replaces the IDR with a band of intra-coded macroblocks
+        // that sweeps across the frame over many frames, so every frame is
+        // roughly the same size and the spike disappears entirely.  This is the
+        // technique Cell Stream (mohasi) uses for the same PC-to-PS3 workload.
+        //
+        // Sunshine ignores the attribute if its encoder cannot do it.
+        {
+            extern volatile int ps3_request_intra_refresh;
+            if (ps3_request_intra_refresh) {
+                err |= addAttributeString(&optionHead, "x-ss-video[0].intraRefresh", "1");
+            }
+        }
+#endif
+
         // Enable YUV444 if requested
         if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_YUV444) {
             err |= addAttributeString(&optionHead, "x-ss-video[0].chromaSamplingType", "1");

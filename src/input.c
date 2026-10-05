@@ -299,7 +299,9 @@ static void input_loop(void *arg) {
                             if (ui_get_mouse_mode() == 0) {
                                 LiSendMouseMoveEvent((short)mdata.x_axis, (short)mdata.y_axis);
                             } else {
-                                LiSendMouseMoveAsMousePositionEvent((short)mdata.x_axis, (short)mdata.y_axis, 1280, 720);
+                                LiSendMouseMoveAsMousePositionEvent((short)mdata.x_axis, (short)mdata.y_axis,
+                                                                   (short)ui_get_stream_width(),
+                                                                   (short)ui_get_stream_height());
                             }
                         }
 

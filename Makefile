@@ -35,9 +35,9 @@ BUILD		:= build
 TIMESTAMP		:= $(shell date +%Y%m%d_%H%M%S)
 OUT_PKG			:= $(BUILD)/$(TARGET)-$(TIMESTAMP).pkg
 OUT_GNPDRM_PKG	:= $(BUILD)/$(TARGET)-$(TIMESTAMP).gnpdrm.pkg
-OFILES			:= src/main.o src/ui.o src/video.o src/ps3_compat.o src/random.o src/net_logger.o src/openssl_compat.o src/connection.o src/input.o src/audio.o src/handshake.o src/moonlight_discovery.o
+OFILES			:= third_party/tiny3d_yuvfix/tiny3d.o src/main.o src/ui.o src/video.o src/ps3_compat.o src/random.o src/net_logger.o src/openssl_compat.o src/connection.o src/input.o src/audio.o src/handshake.o src/moonlight_discovery.o
 # Enable Cell Broadband Engine CPU optimizations for the PowerPC Processing Unit (PPU)
-CFLAGS			+= -mcpu=cell -O2 -Wall -Wextra -Werror=implicit-function-declaration -MMD -MP -I$(PS3DEV)/ppu/include -I$(PS3DEV)/portlibs/ppu/include -I$(PS3DEV)/portlibs/ppu/include/freetype2 -I./src -I./third_party/moonlight-common-c/src -I./third_party/opus/include -include src/openssl_compat.h -fno-lto
+CFLAGS			+= -mcpu=cell -O2 -Wall -Wextra -Werror=implicit-function-declaration -DENABLE_NETWORK_LOGGING=1 -MMD -MP -I$(PS3DEV)/ppu/include -I$(PS3DEV)/portlibs/ppu/include -I$(PS3DEV)/portlibs/ppu/include/freetype2 -I./src -I./third_party/moonlight-common-c/src -I./third_party/opus/include -include src/openssl_compat.h -fno-lto
 LDFLAGS     	+= -fno-lto -Wl,--no-undefined -Wl,--as-needed
 # Link with polarssl for client-side cryptography. The moonlight-common-c
 # submodule expects mbedtls, but we emulate it via src/openssl_compat.c
@@ -66,6 +66,12 @@ $(TARGET).elf: $(OFILES) $(LIBCOMMON) $(LIBOPUS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# tiny3d.c with the YUV shader sign fix (see the note at the top of its
+# nv_shaders.h).  Built with tiny3d's own flags; listed FIRST in OFILES so the
+# linker never pulls the unpatched tiny3d.o out of libtiny3d.a.
+third_party/tiny3d_yuvfix/tiny3d.o: third_party/tiny3d_yuvfix/tiny3d.c third_party/tiny3d_yuvfix/nv_shaders.h
+	$(CC) -O2 -Wall -mcpu=cell -fgnu89-inline -DBIGENDIAN -mhard-float -fmodulo-sched -ffunction-sections -fdata-sections -fno-strict-aliasing -fno-lto -I./third_party/tiny3d_yuvfix -I$(PS3DEV)/ppu/include -c $< -o $@
 
 # Sign EBOOT.BIN with Retail NPDRM after stripping ELF (compatible with both RPCS3 and real hardware)
 pkg: $(TARGET).elf

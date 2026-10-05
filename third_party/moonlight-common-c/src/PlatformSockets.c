@@ -1,15 +1,21 @@
+#include <unistd.h>
 #include "Limelight-internal.h"
 
 #define TEST_PORT_TIMEOUT_SEC 3
 
 #ifdef __PPU__
-// PS3 libnet rejects odd-numbered buffer sizes and any value > ~64KB.
-// Use a conservative minimum and small steps so the fallback loop finds
-// an accepted value quickly.
+// PS3 libnet rejects odd-numbered buffer sizes.  The size it will actually
+// accept is bounded by the libnet memory pool, which the app sizes at startup
+// (see net_init_pool() in src/main.c) -- with PSL1GHT's stock 128 KB pool the
+// ceiling is ~64 KB, with a larger pool it is correspondingly higher.  We
+// cannot query that ceiling, so we ask high and let the loop below find it.
 #define RCV_BUFFER_SIZE_MIN  8192
 #define RCV_BUFFER_SIZE_STEP 4096
 // Global ENOBUFS counter for PS3 network diagnostics
 volatile int ps3_enobufs_count = 0;
+// Receive buffer size the kernel actually accepted for the video socket, for
+// the telemetry line in VideoStream.c.  0 until a video UDP socket is bound.
+volatile int ps3_accepted_rcvbuf = 0;
 #else
 #define RCV_BUFFER_SIZE_MIN  32767
 #define RCV_BUFFER_SIZE_STEP 16384
@@ -199,6 +205,15 @@ int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect) {
         pfd.fd = s;
         pfd.events = POLLIN;
         err = pollSockets(&pfd, 1, 50);
+        if (err < 0 && LastSocketError() == ENOBUFS) {
+            // The poll itself fails with ENOBUFS when libnet's shared pool
+            // is exhausted (the recvfrom check below never saw it).  This
+            // used to tear the whole stream down; it is a momentary
+            // shortage, so report a timeout and let the caller retry.
+            ps3_enobufs_count++;
+            usleep(1000);
+            return 0;
+        }
         if (err <= 0) {
             return err;
         }
@@ -410,8 +425,23 @@ SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCK
                 break;
             }
             else {
+#ifdef __PPU__
+                // ALWAYS halve on PS3 -- never subtract a fixed step.
+                //
+                // libnet appears to require SO_RCVBUF to be aligned (every
+                // accepted value ever observed on this platform is a power of
+                // two; the one documented failure, 93440 = 2^8 * 365, is not
+                // even a multiple of 512).  Subtracting a constant preserves
+                // the remainder, so a misaligned starting value stays
+                // misaligned all the way down and EVERY step fails -- which is
+                // exactly the "rejected entirely, left at the 8KB default"
+                // symptom recorded in VideoStream.c.  Halving a power of two
+                // keeps it a power of two, so the ladder stays valid.
+                bufferSize /= 2;
+#else
                 // Lower the requested size by another step
                 bufferSize -= RCV_BUFFER_SIZE_STEP;
+#endif
             }
         }
 
@@ -428,6 +458,11 @@ SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCK
             SOCKADDR_LEN len = sizeof(bufferSize);
             if (getsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&bufferSize, &len) == 0) {
                 Limelog("Actual receive buffer size: %d\n", bufferSize);
+#ifdef __PPU__
+                if (socketQosType == SOCK_QOS_TYPE_VIDEO) {
+                    ps3_accepted_rcvbuf = bufferSize;
+                }
+#endif
             }
         }
 #endif

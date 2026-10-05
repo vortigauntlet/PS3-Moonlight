@@ -20,6 +20,13 @@ static bool receivedDataFromPeer;
 static uint64_t firstDataTimeMs;
 static bool receivedFullFrame;
 
+#ifdef __PPU__
+// Published for the on-screen stats overlay so the measured receive rate can be
+// compared against the requested bitrate without reading the log.
+volatile int ps3_video_rx_kbps = 0;
+volatile int ps3_video_rxq_bytes = 0;
+#endif
+
 // We can't request an IDR frame until the depacketizer knows
 // that a packet was lost. This timeout bounds the time that
 // the RTP queue will wait for missing/reordered packets.
@@ -145,11 +152,85 @@ static void VideoReceiveThreadProc(void* context) {
     static char batch_data[VIDEO_BATCH_SIZE][VIDEO_MAX_PACKET_SIZE];
     static int  batch_lens[VIDEO_BATCH_SIZE];
 
+    // recvUdpSocket() writes up to receiveSize bytes into a fixed-size staging
+    // slot.  packetSize is now user-selectable, so clamp rather than trust it:
+    // a datagram larger than the slot is truncated (and then rejected) instead
+    // of running off the end of the array.
+    if (receiveSize > VIDEO_MAX_PACKET_SIZE) {
+        Limelog("Video Receive: clamping receiveSize %d to %d\n",
+                receiveSize, VIDEO_MAX_PACKET_SIZE);
+        receiveSize = VIDEO_MAX_PACKET_SIZE;
+    }
+
 #ifdef __PPU__
-    // PS3 network diagnostics: track packets received and transient errors
+    // PS3 network diagnostics.  This line is the primary instrument for finding
+    // the console's real bitrate ceiling, so it carries everything needed to
+    // tell the failure modes apart:
+    //
+    //   rx= tracks the selected bitrate, fecrec/fecfail near 0
+    //        -> the receive path is keeping up; the next step up is worth trying.
+    //   rx= falls short of the selected bitrate, fecfail climbing
+    //        -> packets are lost before we read them; this step is over the
+    //           ceiling, come back down one.
+    //   rxq=/rxqpk= are normally -1. netGetSockInfo is UNIMPLEMENTED on this
+    //        firmware -- it returns -1 on a stock libnet init too -- so -1 says
+    //        nothing about the socket, only about that call. The instruments
+    //        that do work here are rx= against the requested bitrate, fecfail=,
+    //        and the startup "net: probe" line.
+    //   batch= pinned at VIDEO_BATCH_SIZE -> the drain loop itself is the limit,
+    //        not the buffer.
+    //
+    // fecrec/fecfail/oos are per-interval deltas; recv= is cumulative.
     static int ps3_net_pkts_total = 0;
+    static uint64_t ps3_net_bytes_total = 0;
+    static int ps3_net_batch_max = 0;
     static uint64_t ps3_net_last_log = 0;
-    extern volatile int ps3_enobufs_count; // defined in PlatformSockets.c
+    static uint32_t ps3_prev_fec_rec = 0, ps3_prev_fec_fail = 0, ps3_prev_oos = 0;
+    // Decoder-side counters from src/video.c.  Always counted (not HUD-gated),
+    // so every log says whether the DECODER kept pace, not just the network:
+    //   dec  = pictures decoded this second   (1080p60 target: 60)
+    //   shw  = pictures put on screen
+    //   skip = decoded but replaced before display
+    //   drop = access units thrown away before decode (VDEC queue full)
+    extern uint32_t ps3video_get_pics_total(void);
+    extern uint32_t ps3video_get_shown_total(void);
+    extern uint32_t ps3video_get_skipped_total(void);
+    extern uint32_t ps3video_get_dropped_frames(void);
+    extern uint32_t ps3video_take_decode_latency_ms(void);
+    extern int ps3video_take_au_peak(void);
+    extern int ps3_decode_queue_depth(void); // VideoDepacketizer.c
+    extern void ps3video_take_frame_timing(uint32_t *hlat, uint32_t *rxt,
+                                           uint32_t *jit, uint32_t *jit_max);
+    static uint32_t ps3_prev_dec = 0, ps3_prev_shw = 0, ps3_prev_skip = 0, ps3_prev_drop = 0;
+    // video.c zeroes its totals when the decoder is set up; never report that
+    // as a 4-billion-frame negative delta.
+#define PS3_DELTA(cur, prev) ((cur) >= (prev) ? (cur) - (prev) : (cur))
+    // Peak bytes actually queued in the kernel socket buffer over the interval.
+    //
+    // This matters more than buf=.  getsockopt(SO_RCVBUF) reports the value that
+    // was ASKED FOR, not the memory libnet actually funded it with -- on the
+    // stock 128 KB pool a 512 KB request reads back as 512 KB and buffers
+    // nothing like it.  A large buf= next to a rxqpk= that never climbs past
+    // ~60 KB is the signature of a buffer that was accepted but not backed.
+    static int ps3_rxq_peak = 0;
+    extern volatile int ps3_enobufs_count;   // defined in PlatformSockets.c
+    extern volatile int ps3_accepted_rcvbuf; // defined in PlatformSockets.c
+
+    // The counters above are function-scope statics, so they survive into the
+    // next stream, while rtpQueue.stats is zeroed by RtpvInitializeQueue().
+    // Reset them here or the first interval of a second stream reports a delta
+    // against the previous stream's totals, which underflows.
+    ps3_net_pkts_total = 0;
+    ps3_net_bytes_total = 0;
+    ps3_net_batch_max = 0;
+    ps3_rxq_peak = 0;
+    ps3_net_last_log = 0;
+    ps3_prev_fec_rec = 0;
+    ps3_prev_fec_fail = 0;
+    ps3_prev_oos = 0;
+    ps3_prev_dec = ps3_prev_shw = ps3_prev_skip = ps3_prev_drop = 0;
+    ps3_video_rx_kbps = 0;
+    ps3_video_rxq_bytes = 0;
 #endif
 
     while (!PltIsThreadInterrupted(&receiveThread)) {
@@ -185,6 +266,9 @@ static void VideoReceiveThreadProc(void* context) {
                 break;
             }
             batch_lens[batchCount] = err;
+#ifdef __PPU__
+            ps3_net_bytes_total += (uint64_t)err;
+#endif
         }
 
         // Phase 2: Process Phase - Now that the network buffer is safe, 
@@ -263,13 +347,68 @@ static void VideoReceiveThreadProc(void* context) {
 #ifdef __PPU__
         // Update PS3 network stats and log periodically
         ps3_net_pkts_total += batchCount;
+        if (batchCount > ps3_net_batch_max) ps3_net_batch_max = batchCount;
         {
             uint64_t now = PltGetMillis();
             if (ps3_net_last_log == 0) ps3_net_last_log = now;
-            if (now - ps3_net_last_log >= 5000) {
-                Limelog("[PS3-NET] video pkts=%d enobufs=%d batch=%d (5s interval)\n",
-                        ps3_net_pkts_total, ps3_enobufs_count, batchCount);
+            if (now - ps3_net_last_log >= 1000) {
+                uint32_t elapsed = (uint32_t)(now - ps3_net_last_log);
+                // Throughput actually reaching the app, in kbps.
+                uint32_t kbps = elapsed ? (uint32_t)((ps3_net_bytes_total * 8) / elapsed) : 0;
+                RTP_VIDEO_STATS* st = &rtpQueue.stats;
+                int rxq = -1;
+
+                // Kept because it costs nothing and would be genuinely useful
+                // if a firmware or CFW ever implements it -- but see the note
+                // above: this returns -1 on this console.
+                {
+                    netSocketInfo si;
+                    memset(&si, 0, sizeof(si));
+                    if (netGetSockInfo(rtpSocket, &si, 1) >= 0) {
+                        rxq = si.recv_queue_len;
+                    }
+                }
+                if (rxq > ps3_rxq_peak) ps3_rxq_peak = rxq;
+
+                uint32_t t_hlat, t_rxt, t_jit, t_jitmax;
+                ps3video_take_frame_timing(&t_hlat, &t_rxt, &t_jit, &t_jitmax);
+                Limelog("[PS3-NET] rx=%u.%03u Mbps pkts=%d buf=%d rxq=%d rxqpk=%d batch=%d/%d "
+                        "enobufs=%d recv=%u fecrec=%u fecfail=%u oos=%u "
+                        "dec=%u shw=%u skip=%u drop=%u dlat=%ums "
+                        "hlat=%u.%ums rxt=%u.%ums jit=%u.%u/%u.%ums qd=%d au=%d\n",
+                        kbps / 1000, kbps % 1000,
+                        ps3_net_pkts_total,
+                        ps3_accepted_rcvbuf,
+                        rxq, ps3_rxq_peak,
+                        ps3_net_batch_max, VIDEO_BATCH_SIZE,
+                        ps3_enobufs_count,
+                        st->packetCountVideo,
+                        st->packetCountFecRecovered - ps3_prev_fec_rec,
+                        st->packetCountFecFailed - ps3_prev_fec_fail,
+                        st->packetCountOOS - ps3_prev_oos,
+                        PS3_DELTA(ps3video_get_pics_total(), ps3_prev_dec),
+                        PS3_DELTA(ps3video_get_shown_total(), ps3_prev_shw),
+                        PS3_DELTA(ps3video_get_skipped_total(), ps3_prev_skip),
+                        PS3_DELTA(ps3video_get_dropped_frames(), ps3_prev_drop),
+                        ps3video_take_decode_latency_ms(),
+                        t_hlat / 10, t_hlat % 10, t_rxt / 10, t_rxt % 10,
+                        t_jit / 10, t_jit % 10, t_jitmax / 10, t_jitmax % 10,
+                        ps3_decode_queue_depth(), ps3video_take_au_peak());
+                ps3_prev_dec = ps3video_get_pics_total();
+                ps3_prev_shw = ps3video_get_shown_total();
+                ps3_prev_skip = ps3video_get_skipped_total();
+                ps3_prev_drop = ps3video_get_dropped_frames();
+
+                ps3_video_rx_kbps = (int)kbps;
+                ps3_video_rxq_bytes = rxq;
+
+                ps3_prev_fec_rec = st->packetCountFecRecovered;
+                ps3_prev_fec_fail = st->packetCountFecFailed;
+                ps3_prev_oos = st->packetCountOOS;
                 ps3_net_pkts_total = 0;
+                ps3_net_bytes_total = 0;
+                ps3_net_batch_max = 0;
+                ps3_rxq_peak = 0;
                 ps3_enobufs_count = 0;
                 ps3_net_last_log = now;
             }
@@ -373,14 +512,62 @@ int startVideoStream(void* rendererContext, int drFlags) {
     }
 
 #ifdef __PPU__
-    // PS3 libnet has a very small default UDP recv buffer (~8KB) and rejects
-    // SO_RCVBUF values above ~64KB. It also requires even-numbered sizes.
-    // Request 64KB (65536) explicitly; bindUdpSocket()'s fallback loop
-    // will step down in RCV_BUFFER_SIZE_STEP (4096) increments if needed.
-    // Previous code computed 64*1460=93KB which was rejected entirely,
-    // leaving the socket at the unusable 8KB default.
+    // PS3 libnet has a very small default UDP recv buffer (~8KB) and requires
+    // even-numbered sizes.  The old code asked for a flat 64 KB because that was
+    // the most PSL1GHT's 128 KB libnet pool could ever back.  The app now asks
+    // libnet for a much larger pool at startup (net_init_pool() in src/main.c),
+    // so this is sized from the bitrate instead of from that old cap.
     {
-        int videoRcvBufSize = 64 * 1024; // 65536 — even, within PS3 limit
+        // Size the receive buffer from the BURST, not from a time window.
+        //
+        // Sunshine sends each frame as a run of packets back-to-back at link
+        // rate, so the buffer has to swallow a whole frame before the receive
+        // thread gets a look in -- on a gigabit LAN a frame lands in well under
+        // a millisecond.  A time window is a video-playback idea; for a game
+        // stream a deep buffer is latency, not safety.  What actually has to fit
+        // is the largest single burst, which is an IDR frame.
+        //
+        // Frame size is bitrate/fps, so 30 fps doubles the burst for the same
+        // bitrate.  1080p30 at 20 Mbps is a ~101 KB average frame and a ~406 KB
+        // IDR -- the old flat 64 KB could not even hold an average frame there,
+        // and the previous formula here ignored fps entirely.
+        //
+        // bindUdpSocket() steps the request down until the kernel accepts one,
+        // so asking for more than the libnet pool can back is safe.
+        int64_t bytesPerFrame = (int64_t)StreamConfig.bitrate * 125 /
+                                (StreamConfig.fps > 0 ? StreamConfig.fps : 60);
+        int64_t idrBurst = bytesPerFrame * 4 * 5 / 4; // IDR ~4x average, +25% FEC
+        int videoRcvBufSize = (int)(idrBurst * 2);    // two IDRs of headroom
+
+        // Round UP to a power of two.  65536 is the only size this platform is
+        // known to accept, and it is a power of two; the one size known to be
+        // refused (93440) is not even a multiple of 512.  Asking for an
+        // arbitrary byte count risks being refused at every rung of the
+        // step-down ladder and landing on the unusable 8 KB default, which is
+        // worse than not trying at all.
+        {
+            extern volatile int ps3_video_rcvbuf_kb;
+            if (ps3_video_rcvbuf_kb > 0) {
+                // Explicit override from /dev_hdd0/tmp/moonlight_rcvbuf.txt,
+                // honoured exactly.  Note the Jellyfin client measured 512 KB
+                // BEATING Movian's 128 KB on this console, so the default
+                // (burst-derived, larger) is the one with evidence behind it.
+                videoRcvBufSize = ps3_video_rcvbuf_kb * 1024;
+            }
+            else {
+                int pow2 = 64 * 1024; // never ask less than the known-good size
+                while (pow2 < videoRcvBufSize && pow2 < 1024 * 1024) {
+                    pow2 *= 2;
+                }
+                videoRcvBufSize = pow2; // 64K .. 1M
+            }
+        }
+
+        Limelog("[PS3-NET] requesting video rcvbuf=%d bytes for %d kbps @%d fps "
+                "(frame ~%d KB, IDR ~%d KB; halving ladder down to 65536)\n",
+                videoRcvBufSize, StreamConfig.bitrate, StreamConfig.fps,
+                (int)(bytesPerFrame * 5 / 4 / 1024), (int)(idrBurst / 1024));
+
         rtpSocket = bindUdpSocket(RemoteAddr.ss_family, &LocalAddr, AddrLen,
                                   videoRcvBufSize,
                                   SOCK_QOS_TYPE_VIDEO);
