@@ -37,7 +37,9 @@ the PS3.
 
 ### Quick way: the setup script
 
-On the streaming PC, in PowerShell:
+On the streaming PC, double-click `tools\setup-host.cmd` (double-clicking the
+.ps1 itself only opens it in Notepad). It asks for your web UI login, then
+applies the settings. Or, in PowerShell:
 
 ```powershell
 .\tools\setup-host.ps1                  # asks for your web UI login, then applies it
