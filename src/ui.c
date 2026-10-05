@@ -266,7 +266,7 @@ enum {
     // Video
     SR_FPS, SR_RES, SR_BITRATE, SR_PIXFMT, SR_DEBLOCK, SR_PRESENT, SR_NTSC, SR_SPUS,
     // Network & host
-    SR_PACKET, SR_INTRA, SR_VDISPLAY, SR_QUITEXIT,
+    SR_PACKET, SR_INTRA, SR_VDISPLAY, SR_QUITEXIT, SR_AUDIO,
     // Controls
     SR_MOUSE, SR_RUMBLE, SR_TRIGGERS,
     // Display
@@ -1294,7 +1294,7 @@ static void ui_init_fonts() {
 static const char *settings_labels[SETTINGS_ITEM_COUNT] = {
     "Target FPS:", "Resolution:", "Target Bitrate:", "Decoder Output:", "Decode Speed:",
     "Presentation:", "Refresh Rate:", "Decoder SPUs:",
-    "Packet Size:", "Intra Refresh:", "Virtual Display:", "Quit App On Exit:",
+    "Packet Size:", "Intra Refresh:", "Virtual Display:", "Quit App On Exit:", "Audio:",
     "Mouse Mode:", "Rumble:", "Triggers:",
     "VSync Mode:", "Picture Width:", "Picture Height:", "Shift Horizontal:", "Shift Vertical:",
     "Stats Overlay:", "Verbose Logging:",
@@ -1303,7 +1303,7 @@ static const char *settings_labels[SETTINGS_ITEM_COUNT] = {
 static const char *settings_group_names[] = {"Video Settings", "Network & Host", "Controls", "Display", "Settings"};
 static const unsigned char settings_group[SETTINGS_ITEM_COUNT] = {
     0, 0, 0, 0, 0, 0, 0, 0,
-    1, 1, 1, 1,
+    1, 1, 1, 1, 1,
     2, 2, 2,
     3, 3, 3, 3, 3, 3, 3,
     4
@@ -1363,6 +1363,12 @@ static void settings_value_text(int row, char *out, size_t n) {
     case SR_INTRA:      snprintf(out, n, "%s", ui_intra_refresh ? "ON" : "OFF"); break;
     case SR_VDISPLAY:   snprintf(out, n, "%s", ui_virtual_display ? "ON (Apollo / Vibepollo)" : "OFF"); break;
     case SR_QUITEXIT:   snprintf(out, n, "%s", ui_quit_on_exit ? "YES (close it on the host)" : "NO (leave running)"); break;
+    case SR_AUDIO:
+        // HQ: moonlight-common-c asks for high-quality surround at 15 Mbps and up.
+        snprintf(out, n, "%s%s", (ui_audio_channels == 8) ? "7.1 SURROUND"
+                                 : (ui_audio_channels == 6) ? "5.1 SURROUND" : "STEREO",
+                 (ui_audio_channels > 2 && ui_get_bitrate() >= 15000) ? " (high quality)" : "");
+        break;
     case SR_MOUSE:      snprintf(out, n, "%s", (ui_mouse_mode == 0) ? "GAME (Relative / 3D)" : "DESKTOP (Absolute / 1:1)"); break;
     case SR_RUMBLE:     snprintf(out, n, "%s", ui_rumble ? "ON" : "OFF"); break;
     case SR_TRIGGERS:   snprintf(out, n, "%s", ui_trigger_mode ? "ANALOG (pressure)" : "DIGITAL (on / off)"); break;
@@ -1403,6 +1409,13 @@ static int settings_change(int row, int dir) {
     case SR_INTRA:   ui_intra_refresh = !ui_intra_refresh; return 1;
     case SR_VDISPLAY: ui_virtual_display = !ui_virtual_display; return 1;
     case SR_QUITEXIT: ui_quit_on_exit = !ui_quit_on_exit; return 1;
+    case SR_AUDIO: {
+        static const int ch[] = {2, 6, 8};
+        int i = 0;
+        for (int k = 0; k < 3; k++) if (ch[k] == ui_audio_channels) i = k;
+        ui_audio_channels = ch[settings_step(i, dir, 3)];
+        return 1;
+    }
     case SR_MOUSE:   ui_mouse_mode = !ui_mouse_mode; return 1;
     case SR_RUMBLE:  ui_rumble = !ui_rumble; return 1;
     case SR_TRIGGERS: ui_trigger_mode = !ui_trigger_mode; return 1;
