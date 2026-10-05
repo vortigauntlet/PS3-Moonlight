@@ -1467,7 +1467,14 @@ static void ui_loop(void *arg) {
                 float next_x = DrawString(SX(60), SY(125), "Sunshine Host:");
                 
                 SetFontColor((active_main_item == 0) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(next_x + SX(20), SY(125), "[ %s ]", target_ip_str);
+                {
+                    const ui_saved_host_t *sh = ui_get_saved_host(selected_host_idx);
+                    if (sh && sh->name[0] && strcmp(sh->name, "Manual Entry") != 0 &&
+                        strcmp(sh->name, sh->address) != 0)
+                        DrawFormatString(next_x + SX(20), SY(125), "[ %s (%s) ]", sh->name, target_ip_str);
+                    else
+                        DrawFormatString(next_x + SX(20), SY(125), "[ %s ]", target_ip_str);
+                }
 
                 // Row 1: Settings Sub-menu Link
                 SetFontSize(SF(24), SF(24));
