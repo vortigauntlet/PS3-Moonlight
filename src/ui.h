@@ -96,10 +96,19 @@ int  ui_find_host_by_uuid(const char *uuid);
 void ui_set_host_address(int idx, const char *address, const char *name);
 
 /* What the selected host reports, refreshed by the main thread.  running_app:
- * 0 = nothing running, else an app is; name may be "". */
+ * 0 = nothing running, else the id of the app that is; name may be "". */
 void ui_set_host_status(int running_app, const char *app_name, int apollo_family);
 /* The user picked "Quit app on host"; returns 1 once per request. */
 int  ui_take_quit_request(void);
+/* The user chose to start a different app while one is running: quit the
+ * running one first.  Returns 1 once per request, after the app was picked. */
+int  ui_take_switch_quit(void);
+/* Forget a saved host (the caller confirms first); fixes the selection and saves. */
+void ui_remove_saved_host(int idx);
+
+/* A transient message pill above the footer.  Safe from any thread. */
+void ui_toast(const char *msg);
+void ui_toast_for(const char *msg, float hold_seconds);
 
 // Host discovery state helpers
 void ui_set_discovered_hosts(const mld_host_t *hosts, int count);

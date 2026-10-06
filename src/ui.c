@@ -1,8 +1,5 @@
 #include "ui.h"
 #include <tiny3d.h>
-#include <libfont.h>
-#include <ft2build.h>
-#include FT_FREETYPE_H
 #include <math.h>
 #include <malloc.h>
 #include <string.h>
@@ -24,6 +21,13 @@
 #include <Limelight.h>
 #include "video.h"
 #include "audio.h"
+#include "ui_internal.h"
+#include "ui_layout.h"
+#include "ui_theme.h"
+#include "ui_fonts.h"
+#include "ui_draw.h"
+#include "ui_bg.h"
+#include "ui_screens.h"
 
 #define CONFIG_DIR  "/dev_hdd0/game/MNLT00001/USRDIR"
 #define CONFIG_PATH "/dev_hdd0/game/MNLT00001/USRDIR/config.ini"
@@ -33,14 +37,7 @@ static int ui_thread_started = 0;
 static volatile int ui_running = 1;
 static int ui_width = 1280;
 static int ui_height = 720;
-static float scale_x = 1.0f;
-static float scale_y = 1.0f;
-static float scale_font = 1.0f;
 static volatile int ui_state = UI_STATE_IP_ENTRY;
-
-#define SX(x) ((float)(x) * scale_x)
-#define SY(y) ((float)(y) * scale_y)
-#define SF(s) ((u32)(((float)(s) * scale_font < 8.0f) ? 8.0f : ((float)(s) * scale_font)))
 
 // Host IP state
 static int ip_octets[4] = {192, 168, 1, 1};
@@ -212,9 +209,8 @@ static int ui_pixfmt = 0;
 // dominant packet-loss mechanism at these bitrates.  Sunshine silently ignores
 // the request if its encoder cannot do it.
 //
-// There is no room left on the settings page, so this one lives in config.ini
-// only -- set "intra_refresh=0" in
-// /dev_hdd0/game/MNLT00001/USRDIR/config.ini to turn it off.
+// Settings > Advanced > Intra refresh, or "intra_refresh=0" in
+// /dev_hdd0/game/MNLT00001/USRDIR/config.ini.
 static int ui_intra_refresh = 1;
 
 // Skip the in-loop deblocking filter in the decoder.
@@ -277,32 +273,10 @@ static int ui_audio_channels = 2;
 //       Lowest lag, but over Wi-Fi it threw away ~1 in 3 decoded pictures.
 static int ui_low_latency = 1;
 
-// Navigation item counts for Main Menu and Settings Submenu
-// Host / Settings / Connect, plus "Quit app on host" while the host reports one running.
-#define MAIN_MENU_ITEM_COUNT (host_running_app ? 4 : 3)
-static int active_main_item = 0; // 0: Sunshine Host IP, 1: Configure Settings, 2: Connect/Pair
-
-// Settings rows, in display order (grouped).
-enum {
-    // Video
-    SR_FPS, SR_RES, SR_ASPECT, SR_BITRATE, SR_PIXFMT, SR_DEBLOCK, SR_PRESENT, SR_NTSC, SR_SPUS,
-    // Network & host
-    SR_PACKET, SR_INTRA, SR_VDISPLAY, SR_QUITEXIT, SR_AUDIO,
-    // Controls
-    SR_MOUSE, SR_RUMBLE, SR_TRIGGERS,
-    // Display
-    SR_VSYNC, SR_OVS_X, SR_OVS_Y, SR_OVS_XOFF, SR_OVS_YOFF, SR_STATS, SR_VERBOSE,
-    SR_BACK,
-    SETTINGS_ITEM_COUNT
-};
-#define SETTINGS_VISIBLE 10
-static int active_settings_item = 0;
-static int settings_scroll = 0;
-
 static int frames_drawn_this_sec = 0;
-static int ui_fps_actual = 0;
+int ui_fps_actual = 0;
 static u64 last_ui_time = 0;
-static int show_stats = 0; // Default: Stats OFF (0)
+int show_stats = 0; // Default: Stats OFF (0)
 static int ui_verbose = 0; // Default: Verbose Logging OFF (0)
 static int ui_mouse_mode = 0; // Default: 0 = Game Mode (Relative), 1 = Desktop Mode (Absolute)
 
@@ -413,7 +387,7 @@ int ui_get_show_stats() { return show_stats; }
 int ui_get_verbose() { return ui_verbose; }
 int ui_get_mouse_mode(void) { return ui_mouse_mode; }
 
-static char pairing_pin_str[16] = "";
+char pairing_pin_str[16] = "";
 
 void ui_set_pairing_pin(const char *pin) {
     if (pin) {
@@ -429,9 +403,9 @@ const char* ui_get_pairing_pin(void) {
 }
 
 // App Selection State
-static ps3_app_list_t current_app_list;
-static int active_app_idx = 0;
-static volatile int app_selection_confirmed = 0;
+ps3_app_list_t current_app_list;
+int active_app_idx = 0;
+volatile int app_selection_confirmed = 0;
 
 void ui_set_app_list(const ps3_app_list_t *list) {
     if (list) {
@@ -458,7 +432,7 @@ const char* ui_get_selected_app_uuid(void) {
 }
 
 // Error-screen detail line, written by the connect thread, read by the UI.
-static char ui_error_detail[192] = "";
+char ui_error_detail[192] = "";
 void ui_set_error_detail(const char *msg) {
     if (!msg) msg = "";
     strncpy(ui_error_detail, msg, sizeof(ui_error_detail) - 1);
@@ -526,6 +500,21 @@ int ui_upsert_saved_host(const char *name, const char *address) {
     return idx;
 }
 
+void ui_remove_saved_host(int idx) {
+    if (idx < 0 || idx >= saved_host_count) return;
+    for (int i = idx; i < saved_host_count - 1; i++) saved_hosts[i] = saved_hosts[i + 1];
+    saved_host_count--;
+    memset(&saved_hosts[saved_host_count], 0, sizeof(saved_hosts[0]));
+    if (selected_host_idx == idx)
+        selected_host_idx = (saved_host_count > 0) ? (idx < saved_host_count ? idx : saved_host_count - 1) : -1;
+    else if (selected_host_idx > idx)
+        selected_host_idx--;
+    if (selected_host_idx >= 0) ui_set_target_ip(saved_hosts[selected_host_idx].address);
+    host_running_app = 0;
+    host_running_name[0] = 0;
+    ui_save_settings();
+}
+
 void ui_set_host_paired(int idx, int paired) {
     if (idx < 0 || idx >= saved_host_count) return;
     saved_hosts[idx].paired = paired ? 1 : 0;
@@ -558,15 +547,22 @@ void ui_set_host_address(int idx, const char *address, const char *name) {
 // Host status, written by the main thread and read by the UI thread.  Small
 // scalars and one string, written name-first: a torn read shows at worst a
 // stale label for one frame.
-static volatile int host_running_app = 0;
-static char host_running_name[64] = "";
-static volatile int host_is_apollo = 0;
-static volatile int quit_request = 0;
+volatile int host_running_app = 0;      // running app id, 0 = none
+char host_running_name[64] = "";
+volatile int host_is_apollo = 0;
+volatile int quit_request = 0;
+volatile int switch_quit_request = 0;
 
 void ui_set_host_status(int running_app, const char *app_name, int apollo_family) {
     snprintf(host_running_name, sizeof(host_running_name), "%s", app_name ? app_name : "");
     host_is_apollo = apollo_family ? 1 : 0;
-    host_running_app = running_app ? 1 : 0;
+    host_running_app = running_app;
+}
+
+int ui_take_switch_quit(void) {
+    if (!switch_quit_request) return 0;
+    switch_quit_request = 0;
+    return 1;
 }
 
 int ui_take_quit_request(void) {
@@ -576,12 +572,12 @@ int ui_take_quit_request(void) {
 }
 
 // Host Discovery State
-static mld_host_t discovered_hosts[MLD_MAX_HOSTS];
-static int discovered_host_count = 0;
-static int discovery_scanned = 0;
-static int active_host_idx = 0;
-static volatile int host_selection_confirmed = 0;
-static volatile int manual_entry_requested = 0;
+mld_host_t discovered_hosts[MLD_MAX_HOSTS];
+int discovered_host_count = 0;
+int discovery_scanned = 0;
+int active_host_idx = 0;
+volatile int host_selection_confirmed = 0;
+volatile int manual_entry_requested = 0;
 
 void ui_set_discovered_hosts(const mld_host_t *hosts, int count) {
     if (count < 0) count = 0;
@@ -684,6 +680,7 @@ void ui_save_settings(void) {
     fprintf(f, "vsync=%d\n", ui_vsync ? 1 : 0);
     fprintf(f, "stats=%d\n", show_stats ? 1 : 0);
     fprintf(f, "verbose=%d\n", ui_verbose ? 1 : 0);
+    fprintf(f, "ui_theme=%d\n", ui_theme_get_mode());
 
     for (int i = 0; i < saved_host_count; i++) {
         fprintf(f, "\n[host.%d]\n", i);
@@ -800,6 +797,7 @@ void ui_load_settings(void) {
             else if (strcmp(key, "vsync") == 0) ui_vsync = (atoi(val) != 0);
             else if (strcmp(key, "stats") == 0) show_stats = (atoi(val) != 0);
             else if (strcmp(key, "verbose") == 0) ui_verbose = (atoi(val) != 0);
+            else if (strcmp(key, "ui_theme") == 0) { int v = atoi(val); if (v >= 0 && v <= 2) ui_theme_set_mode(v); }
             else if ((strcmp(key, "host_ip") == 0 || strcmp(key, "ip") == 0) && val[0]) {
                 if (saved_host_count == 0) {
                     int i = ui_upsert_saved_host("Saved Host", val);
@@ -923,14 +921,35 @@ void ui_open_osk(void) {
     }
 }
 
-// Native PS3 Message Dialog (Confirmation Pop-up)
+// Native PS3 Message Dialog (Yes/No confirmation)
 static volatile int msg_dialog_active = 0;
+static void (*confirm_done)(int yes, void *user);
+static void *confirm_user;
 
 static void ui_msg_dialog_callback(msgButton button, void *usrData) {
     (void)usrData;
     msgDialogClose(0.0f);
     msg_dialog_active = 0;
-    if (button == MSG_DIALOG_BTN_YES) {
+    void (*done)(int, void *) = confirm_done;
+    confirm_done = NULL;
+    if (done) done(button == MSG_DIALOG_BTN_YES, confirm_user);
+}
+
+int ui_confirm(const char *text, void (*done)(int yes, void *user), void *user) {
+    if (msg_dialog_active || osk_active) return 0;
+    msg_dialog_active = 1;
+    confirm_done = done;
+    confirm_user = user;
+    msgDialogOpen2(MSG_DIALOG_NORMAL | MSG_DIALOG_BTN_TYPE_YESNO | MSG_DIALOG_DEFAULT_CURSOR_NO,
+                   text, ui_msg_dialog_callback, NULL, NULL);
+    return 1;
+}
+
+int ui_modal_active(void) { return msg_dialog_active || osk_active; }
+
+static void exit_confirmed(int yes, void *user) {
+    (void)user;
+    if (yes) {
         ui_push_log("Exit confirmed by user. Quitting to PS3 XMB...");
         ui_stop();
     } else {
@@ -939,17 +958,13 @@ static void ui_msg_dialog_callback(msgButton button, void *usrData) {
 }
 
 void ui_open_exit_dialog(void) {
-    if (msg_dialog_active || osk_active) return;
-    msg_dialog_active = 1;
-    msgDialogOpen2(MSG_DIALOG_NORMAL | MSG_DIALOG_BTN_TYPE_YESNO | MSG_DIALOG_DEFAULT_CURSOR_NO,
-                   "Do you want to quit Moonlight and return to the PS3 XMB?",
-                   ui_msg_dialog_callback, NULL, NULL);
+    ui_confirm("Do you want to quit Moonlight and return to the PS3 XMB?", exit_confirmed, NULL);
 }
 
 static void ui_loop(void *arg);
 
 #define MAX_LOG_LINES 25
-#define MAX_LOG_WIDTH 100
+#define MAX_LOG_WIDTH UI_LOG_WIDTH
 
 static char log_buffer[MAX_LOG_LINES][MAX_LOG_WIDTH];
 static int log_count = 0;
@@ -1056,14 +1071,12 @@ static const unsigned char font_8x8_basic[96][8] = {
     {0x00,0x00,0x4c,0xb2,0x00,0x00,0x00,0x00}, // ~
 };
 
-static void * texture_mem = NULL;
+
+const unsigned char *ui_get_fallback_bitmap(void) { return &font_8x8_basic[0][0]; }
 
 void ui_init(int width, int height) {
     ui_width = (width > 0) ? width : 1280;
     ui_height = (height > 0) ? height : 720;
-    scale_x = (float)ui_width / 1280.0f;
-    scale_y = (float)ui_height / 720.0f;
-    scale_font = (scale_x < scale_y) ? scale_x : scale_y;
 
     sys_mutex_attr_t attr;
     sysMutexAttrInitialize(attr);
@@ -1081,6 +1094,8 @@ void ui_init(int width, int height) {
 
     // Load persisted Host IP and stream settings from HDD
     ui_load_settings();
+    ui_theme_update();
+    ui_layout_init(ui_width, ui_height, ui_output_is_4x3());
 
     {
         char out_log[128];
@@ -1105,6 +1120,16 @@ void ui_init(int width, int height) {
     }
 }
 
+int ui_log_snapshot(char (*out)[UI_LOG_WIDTH], int max_lines) {
+    if (log_mutex_initialized) sysMutexLock(log_mutex, 0);
+    int start = (log_count > max_lines) ? (log_count - max_lines) : 0;
+    int n = 0;
+    for (int i = start; i < log_count; i++) memcpy(out[n++], log_buffer[i], UI_LOG_WIDTH);
+    if (log_mutex_initialized) sysMutexUnlock(log_mutex);
+    return n;
+}
+
+
 void ui_push_log(const char *msg) {
     if (!msg) return;
     if (log_mutex_initialized) sysMutexLock(log_mutex, 0);
@@ -1123,363 +1148,178 @@ void ui_push_log(const char *msg) {
     if (log_mutex_initialized) sysMutexUnlock(log_mutex);
 }
 
-static void draw_background_gradient() {
-    // 1. Base Dark Gray Background (#303030 to #242424)
-    tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-    tiny3d_VertexPos(0, 0, 65535);
-    tiny3d_VertexFcolor(0.188f, 0.188f, 0.188f, 1.0f); // #303030
-    tiny3d_VertexPos(ui_width, 0, 65535);
-    tiny3d_VertexFcolor(0.188f, 0.188f, 0.188f, 1.0f);
-    tiny3d_VertexPos(0, ui_height * 0.72f, 65535);
-    tiny3d_VertexFcolor(0.141f, 0.141f, 0.141f, 1.0f); // #242424
-    tiny3d_VertexPos(ui_width, ui_height * 0.72f, 65535);
-    tiny3d_VertexFcolor(0.141f, 0.141f, 0.141f, 1.0f);
-    tiny3d_End();
-
-    // 2. Titlebar Header Bar (#3F51B5 Material Indigo Blue)
-    tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-    tiny3d_VertexPos(0, 0, 65535);
-    tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f); // #3F51B5
-    tiny3d_VertexPos(ui_width, 0, 65535);
-    tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
-    tiny3d_VertexPos(0, SY(64), 65535);
-    tiny3d_VertexFcolor(0.200f, 0.260f, 0.620f, 1.0f);
-    tiny3d_VertexPos(ui_width, SY(64), 65535);
-    tiny3d_VertexFcolor(0.200f, 0.260f, 0.620f, 1.0f);
-    tiny3d_End();
-
-    // 3. Titlebar Bottom Accent Line (#1A237E Deep Indigo)
-    tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-    tiny3d_VertexPos(0, SY(64), 65535);
-    tiny3d_VertexFcolor(0.102f, 0.137f, 0.494f, 1.0f);
-    tiny3d_VertexPos(ui_width, SY(64), 65535);
-    tiny3d_VertexFcolor(0.102f, 0.137f, 0.494f, 1.0f);
-    tiny3d_VertexPos(0, SY(67), 65535);
-    tiny3d_VertexFcolor(0.102f, 0.137f, 0.494f, 1.0f);
-    tiny3d_VertexPos(ui_width, SY(67), 65535);
-    tiny3d_VertexFcolor(0.102f, 0.137f, 0.494f, 1.0f);
-    tiny3d_End();
-}
-
-// FreeType font engine state
-static FT_Library ft_library = NULL;
-static FT_Face ft_face = NULL;
-static int font_is_ttf = 0;
-
-static void render_ps_button_glyph(u8 chr, u8 *bitmap, short *w, short *h, short *y_correction) {
-    *w = 26;
-    *h = 28;
-    *y_correction = 2; // Aligned with baseline
-    
-    float cx = 13.0f;
-    float cy = 14.0f;
-    float r_outer = 11.5f;
-    float r_inner = 9.5f;
-    
-    for (int y = 0; y < 28; y++) {
-        for (int x = 0; x < 26; x++) {
-            float dx = (float)x - cx;
-            float dy = (float)y - cy;
-            float d = sqrtf(dx * dx + dy * dy);
-            float alpha = 0.0f;
-            
-            if (chr == 1) {
-                // Cross (✕) Button Badge
-                if (d <= r_outer && d >= r_inner) {
-                    float edge = (d > r_outer - 0.75f) ? (r_outer - d) / 0.75f : ((d < r_inner + 0.75f) ? (d - r_inner) / 0.75f : 1.0f);
-                    if (edge > 0.0f) alpha = fmaxf(alpha, edge * 220.0f);
-                }
-                if (d < r_inner - 0.8f) {
-                    float dist_d1 = fabsf(dx - dy) / 1.4142f;
-                    float dist_d2 = fabsf(dx + dy) / 1.4142f;
-                    float line_dist = fminf(dist_d1, dist_d2);
-                    if (line_dist < 1.6f && d < 6.5f) {
-                        float cross_alpha = (line_dist < 0.9f) ? 1.0f : (1.6f - line_dist) / 0.7f;
-                        alpha = fmaxf(alpha, cross_alpha * 255.0f);
-                    }
-                }
-            } else if (chr == 2) {
-                // Circle (◯) Button Badge
-                if (d <= r_outer && d >= r_inner) {
-                    float edge = (d > r_outer - 0.75f) ? (r_outer - d) / 0.75f : ((d < r_inner + 0.75f) ? (d - r_inner) / 0.75f : 1.0f);
-                    if (edge > 0.0f) alpha = fmaxf(alpha, edge * 220.0f);
-                }
-                float ir = 5.2f;
-                float dist_ir = fabsf(d - ir);
-                if (dist_ir < 1.6f) {
-                    float ring_alpha = (dist_ir < 0.9f) ? 1.0f : (1.6f - dist_ir) / 0.7f;
-                    alpha = fmaxf(alpha, ring_alpha * 255.0f);
-                }
-            } else if (chr == 3) {
-                // Triangle (△) Button Badge
-                if (d <= r_outer && d >= r_inner) {
-                    float edge = (d > r_outer - 0.75f) ? (r_outer - d) / 0.75f : ((d < r_inner + 0.75f) ? (d - r_inner) / 0.75f : 1.0f);
-                    if (edge > 0.0f) alpha = fmaxf(alpha, edge * 220.0f);
-                }
-                float ty = dy + 1.0f;
-                float dist_bottom = fabsf(ty - 4.0f);
-                float dist_left = fabsf(dx * 0.866f + ty * 0.5f + 1.5f);
-                float dist_right = fabsf(-dx * 0.866f + ty * 0.5f + 1.5f);
-                if (ty <= 4.2f && ty >= -5.5f && fabsf(dx) <= (ty + 5.5f) * 0.65f + 1.2f) {
-                    float tri_dist = fminf(dist_bottom, fminf(dist_left, dist_right));
-                    if (tri_dist < 1.5f) {
-                        float tri_alpha = (tri_dist < 0.8f) ? 1.0f : (1.5f - tri_dist) / 0.7f;
-                        alpha = fmaxf(alpha, tri_alpha * 255.0f);
-                    }
-                }
-            } else if (chr == 4) {
-                // Square (◻) Button Badge
-                if (d <= r_outer && d >= r_inner) {
-                    float edge = (d > r_outer - 0.75f) ? (r_outer - d) / 0.75f : ((d < r_inner + 0.75f) ? (d - r_inner) / 0.75f : 1.0f);
-                    if (edge > 0.0f) alpha = fmaxf(alpha, edge * 220.0f);
-                }
-                float max_d = fmaxf(fabsf(dx), fabsf(dy));
-                float sq_dist = fabsf(max_d - 4.8f);
-                if (sq_dist < 1.5f && max_d <= 5.5f) {
-                    float sq_alpha = (sq_dist < 0.8f) ? 1.0f : (1.5f - sq_dist) / 0.7f;
-                    alpha = fmaxf(alpha, sq_alpha * 255.0f);
-                }
-            } else if (chr == 5) {
-                // D-Pad Up/Down (↕) Icon
-                if (fabsf(dx) <= 2.2f && fabsf(dy) <= 8.5f) {
-                    alpha = 240.0f;
-                }
-                if (dy < -2.0f && dy >= -9.5f) {
-                    float arrow_w = (dy + 9.5f) * 0.9f;
-                    if (fabsf(dx) <= arrow_w + 0.8f) {
-                        alpha = 255.0f;
-                    }
-                }
-                if (dy > 2.0f && dy <= 9.5f) {
-                    float arrow_w = (9.5f - dy) * 0.9f;
-                    if (fabsf(dx) <= arrow_w + 0.8f) {
-                        alpha = 255.0f;
-                    }
-                }
-            } else if (chr == 6) {
-                // Heart (♥) Symbol
-                float d_left = sqrtf((dx + 4.0f) * (dx + 4.0f) + (dy + 2.5f) * (dy + 2.5f));
-                float d_right = sqrtf((dx - 4.0f) * (dx - 4.0f) + (dy + 2.5f) * (dy + 2.5f));
-                if (d_left <= 4.8f) {
-                    float edge = (d_left > 4.0f) ? (4.8f - d_left) / 0.8f : 1.0f;
-                    alpha = fmaxf(alpha, edge * 255.0f);
-                }
-                if (d_right <= 4.8f) {
-                    float edge = (d_right > 4.0f) ? (4.8f - d_right) / 0.8f : 1.0f;
-                    alpha = fmaxf(alpha, edge * 255.0f);
-                }
-                if (dy >= -2.5f && dy <= 8.5f) {
-                    float max_w = (8.5f - dy) * 0.77f;
-                    if (fabsf(dx) <= max_w + 0.8f) {
-                        float edge = (fabsf(dx) > max_w) ? (max_w + 0.8f - fabsf(dx)) / 0.8f : 1.0f;
-                        alpha = fmaxf(alpha, edge * 255.0f);
-                    }
-                }
-            }
-            
-            if (alpha > 255.0f) alpha = 255.0f;
-            bitmap[y * 32 + x] = (u8)alpha;
-        }
-    }
-}
-
-static void ttf_render_callback(u8 chr, u8 *bitmap, short *w, short *h, short *y_correction) {
-    memset(bitmap, 0, 32 * 32);
-    *w = 0;
-    *h = 0;
-    *y_correction = 0;
-    
-    // Check for Custom Glyph slots (1: Cross, 2: Circle, 3: Triangle, 4: Square, 5: D-Pad, 6: Heart)
-    if (chr >= 1 && chr <= 6) {
-        render_ps_button_glyph(chr, bitmap, w, h, y_correction);
-        return;
-    }
-    
-    if (!ft_face) return;
-    
-    // Custom spacing for space character
-    if (chr == ' ') {
-        *w = 10;
-        *h = 1;
-        *y_correction = 0;
-        return;
-    }
-    
-    FT_UInt glyph_index = FT_Get_Char_Index(ft_face, (FT_ULong)chr);
-    if (glyph_index == 0) return;
-    
-    if (FT_Load_Glyph(ft_face, glyph_index, FT_LOAD_DEFAULT)) return;
-    if (FT_Render_Glyph(ft_face->glyph, FT_RENDER_MODE_NORMAL)) return;
-    
-    FT_GlyphSlot slot = ft_face->glyph;
-    int bw = slot->bitmap.width;
-    int bh = slot->bitmap.rows;
-    if (bw > 32) bw = 32;
-    if (bh > 32) bh = 32;
-    
-    *w = (short)(slot->advance.x >> 6);
-    if (*w <= 0) *w = (short)(bw + 2);
-    *h = (short)bh;
-    *y_correction = (short)(26 - slot->bitmap_top);
-    if (*y_correction < 0) *y_correction = 0;
-    
-    for (int y = 0; y < bh; y++) {
-        for (int x = 0; x < bw; x++) {
-            u8 val = slot->bitmap.buffer[y * slot->bitmap.pitch + x];
-            bitmap[y * 32 + x] = val;
-        }
-    }
-}
-
-static void ui_init_fonts() {
-    ResetFont();
-    font_is_ttf = 0;
-    
-    // PlayStation 3 internal system fonts (ordered by preference)
-    static const char *font_candidates[] = {
-        "/dev_flash/data/font/SCE-PS3-RD-R-LATIN.TTF",
-        "/dev_flash/data/font/SCE-PS3-SR-R-LATIN.TTF",
-        "/dev_flash/data/font/SCE-PS3-VR-R-LATIN.TTF",
-        "/dev_flash/data/font/SCE-PS3-DH-R-CGB.TTF",
-        NULL
-    };
-    
-    if (FT_Init_FreeType(&ft_library) == 0) {
-        for (int i = 0; font_candidates[i] != NULL; i++) {
-            if (FT_New_Face(ft_library, font_candidates[i], 0, &ft_face) == 0) {
-                FT_Set_Pixel_Sizes(ft_face, 0, 30);
-                
-                texture_mem = tiny3d_AllocTexture(1024 * 1024);
-                if (texture_mem) {
-                    AddFontFromTTF((u8 *)texture_mem, 1, 127, 32, 32, ttf_render_callback);
-                    font_is_ttf = 1;
-                    char log_buf[96];
-                    snprintf(log_buf, sizeof(log_buf), "Font: Loaded FreeType TTF (%s)", font_candidates[i]);
-                    ui_push_log(log_buf);
-                    break;
-                }
-            }
-        }
-    }
-    
-    // Fallback to built-in bitmap font if TTF failed or files unavailable
-    if (!font_is_ttf) {
-        if (!texture_mem) {
-            texture_mem = tiny3d_AllocTexture(64 * 1024);
-        }
-        if (texture_mem) {
-            AddFontFromBitmapArray((u8 *)font_8x8_basic, (u8 *)texture_mem, 32, 127, 8, 8, 1, BIT7_FIRST_PIXEL);
-            ui_push_log("Font: Loaded fallback 8x8 bitmap font");
-        }
-    }
-    
-    SetCurrentFont(0);
-    SetFontSize(SF(16), SF(16));
-    SetFontColor(0xffffffff, 0x00000000);
-}
 
 // ---------------------------------------------------------------------------
-// Settings page: a scrolling list, one row per SR_* id, grouped.
+// Settings model.  Rows are the SR_* ids from 1.4.0; categories, labels, value
+// wording and help text are what the settings screen shows.
 // ---------------------------------------------------------------------------
 static const char *settings_labels[SETTINGS_ITEM_COUNT] = {
-    "Target FPS:", "Resolution:", "Picture Shape:", "Target Bitrate:", "Decoder Output:", "Decode Speed:",
-    "Presentation:", "Refresh Rate:", "Decoder SPUs:",
-    "Packet Size:", "Intra Refresh:", "Virtual Display:", "Quit App On Exit:", "Audio:",
-    "Mouse Mode:", "Rumble:", "Triggers:",
-    "VSync Mode:", "Picture Width:", "Picture Height:", "Shift Horizontal:", "Shift Vertical:",
-    "Stats Overlay:", "Verbose Logging:",
-    ""
-};
-static const char *settings_group_names[] = {"Video Settings", "Network & Host", "Controls", "Display", "Settings"};
-static const unsigned char settings_group[SETTINGS_ITEM_COUNT] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 0,
-    1, 1, 1, 1, 1,
-    2, 2, 2,
-    3, 3, 3, 3, 3, 3, 3,
-    4
+    [SR_FPS] = "Frame rate", [SR_RES] = "Resolution", [SR_ASPECT] = "Aspect",
+    [SR_BITRATE] = "Bitrate", [SR_PIXFMT] = "Decoder output", [SR_DEBLOCK] = "Decode speed",
+    [SR_PRESENT] = "Frame pacing", [SR_NTSC] = "Refresh timing", [SR_SPUS] = "Decoder SPUs",
+    [SR_PACKET] = "Packet size", [SR_INTRA] = "Intra refresh", [SR_VDISPLAY] = "Virtual display",
+    [SR_QUITEXIT] = "Quit game when I leave", [SR_AUDIO] = "Audio",
+    [SR_MOUSE] = "Mouse", [SR_RUMBLE] = "Vibration", [SR_TRIGGERS] = "Triggers",
+    [SR_VSYNC] = "VSync", [SR_OVS_X] = "Picture width", [SR_OVS_Y] = "Picture height",
+    [SR_OVS_XOFF] = "Move picture left/right", [SR_OVS_YOFF] = "Move picture up/down",
+    [SR_STATS] = "Performance overlay", [SR_VERBOSE] = "Verbose logging", [SR_THEME] = "Theme",
 };
 
-static void settings_clamp_scroll(void) {
-    if (active_settings_item < settings_scroll) settings_scroll = active_settings_item;
-    if (active_settings_item >= settings_scroll + SETTINGS_VISIBLE)
-        settings_scroll = active_settings_item - SETTINGS_VISIBLE + 1;
-    if (settings_scroll > SETTINGS_ITEM_COUNT - SETTINGS_VISIBLE) settings_scroll = SETTINGS_ITEM_COUNT - SETTINGS_VISIBLE;
-    if (settings_scroll < 0) settings_scroll = 0;
+static const int cat_picture[]    = { SR_RES, SR_FPS, SR_BITRATE, SR_ASPECT };
+static const int cat_sound[]      = { SR_AUDIO };
+static const int cat_controller[] = { SR_RUMBLE, SR_TRIGGERS, SR_MOUSE };
+static const int cat_screen[]     = { SR_THEME, SR_OVS_X, SR_OVS_Y, SR_OVS_XOFF, SR_OVS_YOFF, SR_STATS };
+static const int cat_pc[]         = { SR_VDISPLAY, SR_QUITEXIT };
+static const int cat_advanced[]   = { SR_PIXFMT, SR_DEBLOCK, SR_PRESENT, SR_NTSC, SR_SPUS,
+                                      SR_PACKET, SR_INTRA, SR_VSYNC, SR_VERBOSE };
+
+static const struct { const char *name, *note; const int *rows; int count; } settings_cats[] = {
+    { "Picture",    "", cat_picture,    (int)(sizeof(cat_picture) / sizeof(int)) },
+    { "Sound",      "", cat_sound,      (int)(sizeof(cat_sound) / sizeof(int)) },
+    { "Controller", "", cat_controller, (int)(sizeof(cat_controller) / sizeof(int)) },
+    { "Screen",     "", cat_screen,     (int)(sizeof(cat_screen) / sizeof(int)) },
+    { "PC",         "", cat_pc,         (int)(sizeof(cat_pc) / sizeof(int)) },
+    { "Advanced",   "For troubleshooting. The defaults are best for most people.",
+                    cat_advanced, (int)(sizeof(cat_advanced) / sizeof(int)) },
+};
+#define SETTINGS_CATS ((int)(sizeof(settings_cats) / sizeof(settings_cats[0])))
+
+int ui_settings_cat_count(void) { return SETTINGS_CATS; }
+const char *ui_settings_cat_name(int c) { return (c >= 0 && c < SETTINGS_CATS) ? settings_cats[c].name : ""; }
+const char *ui_settings_cat_note(int c) { return (c >= 0 && c < SETTINGS_CATS) ? settings_cats[c].note : ""; }
+int ui_settings_cat_rows(int c, const int **rows) {
+    if (c < 0 || c >= SETTINGS_CATS) { *rows = NULL; return 0; }
+    *rows = settings_cats[c].rows;
+    return settings_cats[c].count;
+}
+const char *ui_settings_label(int row) {
+    return (row >= 0 && row < SETTINGS_ITEM_COUNT && settings_labels[row]) ? settings_labels[row] : "";
 }
 
-static void settings_value_text(int row, char *out, size_t n) {
+static const char *res_name(int w, int h, char *buf, size_t n) {
+    if (w == 1280 && h == 720) return "720p";
+    if (w == 1920 && h == 1080) return "1080p";
+    snprintf(buf, n, "%dx%d", w, h);
+    return buf;
+}
+
+void ui_settings_value(int row, char *out, size_t n) {
     switch (row) {
-    case SR_FPS: {
-        int x100 = ui_get_refresh_x100();
-        char rate[24];
-        if (x100 % 100) snprintf(rate, sizeof(rate), "%d.%02d FPS", x100 / 100, x100 % 100);
-        else snprintf(rate, sizeof(rate), "%d FPS", x100 / 100);
-        if (ui_fps) snprintf(out, n, "%s", rate);
-        else snprintf(out, n, "AUTO (%s, %s output)", rate, ui_output_is_50hz() ? "50 Hz" : "60 Hz");
+    case SR_FPS:
+        if (ui_fps) snprintf(out, n, "%d", ui_fps);
+        else snprintf(out, n, "Auto (%d)", ui_get_fps());
+        break;
+    case SR_RES: {
+        char b[24];
+        const char *nm = res_name(ui_get_stream_width(), ui_get_stream_height(), b, sizeof(b));
+        if (ui_res_idx == RES_IDX_AUTO) snprintf(out, n, "Auto (%s)", nm);
+        else snprintf(out, n, "%s", nm);
         break;
     }
-    case SR_RES:
-        snprintf(out, n, "%s%dx%d%s%s", (ui_res_idx == RES_IDX_AUTO) ? "AUTO (" : "",
-                 ui_get_stream_width(), ui_get_stream_height(),
-                 (ui_res_idx == RES_IDX_AUTO) ? ")" : "",
-                 (ui_mode_mb_rate() > 522240u) ? "  (OVER Level 4.2)"
-                 : (ui_mode_mb_rate() > 245760u) ? "  (needs Level 4.2)"
-                 : (ui_get_stream_width() * 3 == ui_get_stream_height() * 4) ? "  4:3" : "");
-        break;
-    case SR_ASPECT:
-        snprintf(out, n, "%s (%s screen)", ui_aspect_mode ? "STRETCH to fill" : "FIT (black bars)",
-                 ui_output_is_4x3() ? "4:3" : "16:9");
-        break;
+    case SR_ASPECT:  snprintf(out, n, "%s", ui_aspect_mode ? "Stretch" : "Fit"); break;
     case SR_BITRATE: {
         int kbps = ui_bitrate_options[ui_bitrate_idx];
         if (kbps % 1000 == 0) snprintf(out, n, "%d Mbps", kbps / 1000);
         else snprintf(out, n, "%.1f Mbps", (float)kbps / 1000.0f);
         break;
     }
-    case SR_PACKET:
-        snprintf(out, n, "%d bytes - %s", ui_packet_size_options[ui_packet_size_idx],
-                 (ui_packet_size_options[ui_packet_size_idx] == 1024) ? "original" : "fewer syscalls");
-        break;
-    case SR_PIXFMT:
-        snprintf(out, n, "%s", ui_get_pixel_format() ? "YUV420 (GPU convert, faster)"
-                               : ui_pixfmt ? "ARGB32 (960 wide cannot use YUV)" : "ARGB32 (original)");
-        break;
-    case SR_DEBLOCK:
-        snprintf(out, n, "%s", (ui_no_deblock == 1) ? "FAST (no deblocking)"
-                               : (ui_no_deblock == 0) ? "QUALITY (normal)" : "AUTO (fast at 1080p50/60)");
-        break;
-    case SR_PRESENT:
-        snprintf(out, n, "%s", (ui_low_latency == 2) ? "NEWEST (lowest lag)"
-                               : (ui_low_latency == 0) ? "SMOOTH" : "BALANCED");
-        break;
-    case SR_NTSC:
-        snprintf(out, n, "%s", ui_ntsc_rate ? "59.94 Hz (NTSC)" : "Whole numbers (60 Hz)");
-        break;
+    case SR_PACKET:  snprintf(out, n, "%d", ui_packet_size_options[ui_packet_size_idx]); break;
+    case SR_PIXFMT:  snprintf(out, n, "%s", ui_get_pixel_format() ? "YUV (faster)" : "ARGB (compatible)"); break;
+    case SR_DEBLOCK: snprintf(out, n, "%s", (ui_no_deblock == 1) ? "Fast" : (ui_no_deblock == 0) ? "Quality" : "Auto"); break;
+    case SR_PRESENT: snprintf(out, n, "%s", (ui_low_latency == 2) ? "Lowest lag" : (ui_low_latency == 0) ? "Smoothest" : "Balanced"); break;
+    case SR_NTSC:    snprintf(out, n, "%s", ui_ntsc_rate ? "59.94 Hz" : "60 Hz"); break;
     case SR_SPUS:
-        if (ui_vdec_spus == 0) snprintf(out, n, "AUTO");
+        if (ui_vdec_spus == 0) snprintf(out, n, "Auto");
         else snprintf(out, n, "%d", ui_vdec_spus);
         break;
-    case SR_INTRA:      snprintf(out, n, "%s", ui_intra_refresh ? "ON" : "OFF"); break;
-    case SR_VDISPLAY:   snprintf(out, n, "%s", ui_virtual_display ? "ON (Apollo / Vibepollo)" : "OFF"); break;
-    case SR_QUITEXIT:   snprintf(out, n, "%s", ui_quit_on_exit ? "YES (close it on the host)" : "NO (leave running)"); break;
+    case SR_INTRA:    snprintf(out, n, "%s", ui_intra_refresh ? "On" : "Off"); break;
+    case SR_VDISPLAY: snprintf(out, n, "%s", ui_virtual_display ? "On" : "Off"); break;
+    case SR_QUITEXIT: snprintf(out, n, "%s", ui_quit_on_exit ? "Yes" : "No"); break;
     case SR_AUDIO:
         // HQ: moonlight-common-c asks for high-quality surround at 15 Mbps and up.
-        snprintf(out, n, "%s%s", (ui_audio_channels == 8) ? "7.1 SURROUND"
-                                 : (ui_audio_channels == 6) ? "5.1 SURROUND" : "STEREO",
-                 (ui_audio_channels > 2 && ui_get_bitrate() >= 15000) ? " (high quality)" : "");
+        snprintf(out, n, "%s%s", (ui_audio_channels == 8) ? "7.1 Surround"
+                                 : (ui_audio_channels == 6) ? "5.1 Surround" : "Stereo",
+                 (ui_audio_channels > 2 && ui_get_bitrate() >= 15000) ? " - HQ" : "");
         break;
-    case SR_MOUSE:      snprintf(out, n, "%s", (ui_mouse_mode == 0) ? "GAME (Relative / 3D)" : "DESKTOP (Absolute / 1:1)"); break;
-    case SR_RUMBLE:     snprintf(out, n, "%s", ui_rumble ? "ON" : "OFF"); break;
-    case SR_TRIGGERS:   snprintf(out, n, "%s", ui_trigger_mode ? "ANALOG (pressure)" : "DIGITAL (on / off)"); break;
-    case SR_VSYNC:      snprintf(out, n, "%s", ui_vsync ? "ON (Smooth 60Hz)" : "OFF (Low Latency)"); break;
-    case SR_OVS_X:      snprintf(out, n, "%d%%", ui_ovs_x); break;
-    case SR_OVS_Y:      snprintf(out, n, "%d%%", ui_ovs_y); break;
-    case SR_OVS_XOFF:   snprintf(out, n, "%+d", ui_ovs_xoff); break;
-    case SR_OVS_YOFF:   snprintf(out, n, "%+d", ui_ovs_yoff); break;
-    case SR_STATS:      snprintf(out, n, "%s", show_stats ? "ON" : "OFF"); break;
-    case SR_VERBOSE:    snprintf(out, n, "%s", ui_verbose ? "ON" : "OFF"); break;
-    default:            out[0] = '\0'; break;
+    case SR_MOUSE:    snprintf(out, n, "%s", (ui_mouse_mode == 0) ? "Game" : "Desktop"); break;
+    case SR_RUMBLE:   snprintf(out, n, "%s", ui_rumble ? "On" : "Off"); break;
+    case SR_TRIGGERS: snprintf(out, n, "%s", ui_trigger_mode ? "Pressure-sensitive" : "On/off"); break;
+    case SR_VSYNC:    snprintf(out, n, "%s", ui_vsync ? "On" : "Off"); break;
+    case SR_OVS_X:    snprintf(out, n, "%d%%", ui_ovs_x); break;
+    case SR_OVS_Y:    snprintf(out, n, "%d%%", ui_ovs_y); break;
+    case SR_OVS_XOFF: snprintf(out, n, "%+d", ui_ovs_xoff); break;
+    case SR_OVS_YOFF: snprintf(out, n, "%+d", ui_ovs_yoff); break;
+    case SR_STATS:    snprintf(out, n, "%s", show_stats ? "On" : "Off"); break;
+    case SR_VERBOSE:  snprintf(out, n, "%s", ui_verbose ? "On" : "Off"); break;
+    case SR_THEME: {
+        int m = ui_theme_get_mode();
+        snprintf(out, n, "%s", m == UI_THEME_DAY ? "Day" : m == UI_THEME_NIGHT ? "Night" : "Auto");
+        break;
     }
+    default:          out[0] = '\0'; break;
+    }
+}
+
+void ui_settings_help(int row, char *out, size_t n) {
+    const char *h = "";
+    switch (row) {
+    case SR_RES:
+        h = "The size of the picture your PC sends. Auto picks one that suits your TV; bigger is sharper but harder work for the PS3.";
+        break;
+    case SR_FPS:
+        h = "Pictures per second. Auto matches your TV (60, or 50 on a PAL set). 30 is gentler on the PS3 and your network.";
+        break;
+    case SR_BITRATE:
+        h = "How much data the video uses. More looks cleaner but needs a faster network; this PS3 manages about 25 Mbps at most.";
+        break;
+    case SR_ASPECT:
+        h = "Fit keeps the picture's shape and adds black bars if needed. Stretch fills the whole screen.";
+        break;
+    case SR_AUDIO:
+        h = "Stereo works everywhere. 5.1 and 7.1 need a surround system, and high quality switches on at 15 Mbps and up.";
+        break;
+    case SR_RUMBLE:   h = "Passes the game's vibration on to your controller."; break;
+    case SR_TRIGGERS: h = "Pressure-sensitive uses how far you squeeze L2 and R2. On/off treats them as plain buttons."; break;
+    case SR_MOUSE:    h = "Game moves the cursor like a camera, for 3D games. Desktop points at the exact spot, for apps and menus."; break;
+    case SR_THEME:    h = "Auto uses the day look from 7:00 to 19:00 by the console clock, and the night look after that."; break;
+    case SR_OVS_X:    h = "Shrinks the picture sideways so your TV does not cut off the edges. Menus and games both use it."; break;
+    case SR_OVS_Y:    h = "Shrinks the picture vertically so your TV does not cut off the edges. Menus and games both use it."; break;
+    case SR_OVS_XOFF: h = "Moves the whole picture left or right."; break;
+    case SR_OVS_YOFF: h = "Moves the whole picture up or down."; break;
+    case SR_STATS:    h = "Shows frame rate, delay and network numbers over the game."; break;
+    case SR_VDISPLAY: h = "Lets Apollo and Vibepollo create a screen that matches the PS3's picture exactly. Plain Sunshine ignores it."; break;
+    case SR_QUITEXIT: h = "Closes the game on your PC when you stop streaming. If the connection drops, the game stays open so you can resume."; break;
+    case SR_PIXFMT:   h = "YUV does the colour conversion on the graphics chip, which is faster. It needs a stream wider than 960."; break;
+    case SR_DEBLOCK:  h = "Skipping the deblocking filter decodes faster at a small cost in sharpness. Auto does it only at 1080p 50 or 60."; break;
+    case SR_PRESENT:  h = "Smoothest queues frames for even motion. Lowest lag shows the newest frame each refresh. Balanced sits between."; break;
+    case SR_NTSC:     h = "59.94 Hz is what the PS3 really outputs as sixty, and it avoids a stutter every 17 seconds. Use 60 Hz only if your host misbehaves."; break;
+    case SR_SPUS:     h = "How many of the PS3's SPU cores decode video. Auto is best unless you are testing."; break;
+    case SR_PACKET:   h = "Bytes per network packet. 1392 is more efficient; 1024 is the original and safest."; break;
+    case SR_INTRA:    h = "Spreads the full-picture refresh over many frames instead of one big burst, which avoids lost packets. Leave it on."; break;
+    case SR_VSYNC:    h = "On waits for the TV's refresh for a smooth picture. Off has less lag but can tear."; break;
+    case SR_VERBOSE:  h = "Writes extra detail to the log. Only for troubleshooting."; break;
+    default: break;
+    }
+    if (row == SR_RES) {
+        unsigned int mb = ui_mode_mb_rate();
+        snprintf(out, n, "%s%s", h,
+                 (mb > 522240u) ? " This is beyond what the PS3 decoder can do."
+                 : (mb > 245760u) ? " It needs the decoder's Level 4.2 mode." : "");
+    } else {
+        snprintf(out, n, "%s", h);
+    }
+}
+
+void ui_summary_parts(char parts[4][24]) {
+    char b[24];
+    const char *nm = res_name(ui_get_stream_width(), ui_get_stream_height(), b, sizeof(b));
+    snprintf(parts[0], 24, "%s", nm);
+    snprintf(parts[1], 24, "%d FPS", ui_get_fps());
+    int kbps = ui_get_bitrate();
+    if (kbps % 1000 == 0) snprintf(parts[2], 24, "%d Mbps", kbps / 1000);
+    else snprintf(parts[2], 24, "%.1f Mbps", (float)kbps / 1000.0f);
+    snprintf(parts[3], 24, "%s", ui_audio_channels == 8 ? "7.1 Surround"
+                                : ui_audio_channels == 6 ? "5.1 Surround" : "Stereo");
 }
 
 static int settings_step(int v, int dir, int count) { return (v + dir + count) % count; }
@@ -1529,166 +1369,64 @@ static int settings_change(int row, int dir) {
     case SR_OVS_YOFF: ui_ovs_yoff = settings_clamp(ui_ovs_yoff + 2 * dir, -OVS_OFF_LIMIT, OVS_OFF_LIMIT); ui_ovs_configured = 1; return 1;
     case SR_STATS:   show_stats = !show_stats; return 1;
     case SR_VERBOSE: ui_verbose = !ui_verbose; return 1;
+    case SR_THEME:   ui_theme_set_mode(settings_step(ui_theme_get_mode(), dir, 3)); return 1;
     default: return 0;
     }
+}
+
+int ui_settings_change(int row, int dir) {
+    if (!settings_change(row, dir)) return 0;
+    ui_save_settings();
+    return 1;
 }
 
 // Overscan: shrink the whole picture toward the centre and shift it.  Applied
 // to the 2D viewport before anything is drawn, so menus and the video quad move
 // together.  At 100% / 0 this is the identity (the viewport tiny3d already used).
+// Offsets are in 1280x720 units.
 static void ui_apply_overscan(void) {
     float sx = (float)ui_ovs_x / 100.0f, sy = (float)ui_ovs_y / 100.0f;
-    float px = ((float)ui_width * (1.0f - sx)) * 0.5f + SX(ui_ovs_xoff);
-    float py = ((float)ui_height * (1.0f - sy)) * 0.5f + SY(ui_ovs_yoff);
+    float px = ((float)ui_width * (1.0f - sx)) * 0.5f + (float)ui_ovs_xoff * (float)ui_width / 1280.0f;
+    float py = ((float)ui_height * (1.0f - sy)) * 0.5f + (float)ui_ovs_yoff * (float)ui_height / 720.0f;
     tiny3d_UserViewport(1, px, py, sx, sy, 1.0f, 1.0f);
 }
 
 static void ui_loop(void *arg) {
     (void)arg;
     ps3_pad_state_t pad;
-    
+    ps3_pad_state_t no_pad;
+    memset(&no_pad, 0, sizeof(no_pad));
+
     tiny3d_Init(1024 * 1024); // 1MB vertex buffer
-    ui_init_fonts();
-    
-    // Enable Alpha Test and Blending to eliminate solid black texture boxes around font glyphs
+    ui_fonts_init();
+    ui_screens_init();
+
+    // Alpha test and blending keep the font glyphs from drawing black boxes.
     tiny3d_AlphaTest(1, 0, TINY3D_ALPHA_FUNC_GREATER);
-    tiny3d_BlendFunc(1, 
-        TINY3D_BLEND_FUNC_SRC_RGB_SRC_ALPHA | TINY3D_BLEND_FUNC_SRC_ALPHA_SRC_ALPHA,
-        TINY3D_BLEND_FUNC_DST_RGB_ONE_MINUS_SRC_ALPHA | TINY3D_BLEND_FUNC_DST_ALPHA_ONE_MINUS_SRC_ALPHA,
-        TINY3D_BLEND_RGB_FUNC_ADD | TINY3D_BLEND_ALPHA_FUNC_ADD);
-    
+    ui_blend_set(UI_BLEND_NORMAL);
+
+    int frame = 0;
     while (ui_running) {
         // Pump sysutil event callbacks to service OSK and GameOS events
         sysUtilCheckCallback();
         ps3input_get_data(&pad);
-        
-        // Black while streaming: it is the colour of the bars round a stream
-        // whose shape does not match the screen.
-        tiny3d_Clear(ui_state == UI_STATE_STREAMING ? 0x000000ff : 0x303030ff, TINY3D_CLEAR_ALL);
-        
-        // Handle input for UI menu states when OSK dialog is not actively capturing input
-        if (ui_state == UI_STATE_IP_ENTRY) {
-            if (!osk_active && !msg_dialog_active) {
-                // The quit row vanishes when the host stops reporting an app.
-                if (active_main_item >= MAIN_MENU_ITEM_COUNT) active_main_item = MAIN_MENU_ITEM_COUNT - 1;
-                // Vertical navigation across main menu rows
-                if (pad.buttons_pressed & UP_FLAG) {
-                    active_main_item = (active_main_item + MAIN_MENU_ITEM_COUNT - 1) % MAIN_MENU_ITEM_COUNT;
-                }
-                if (pad.buttons_pressed & DOWN_FLAG) {
-                    active_main_item = (active_main_item + 1) % MAIN_MENU_ITEM_COUNT;
-                }
-                
-                // Action handling per main menu item
-                if (active_main_item == 0) {
-                    // Host IP row: Open native OSK keyboard on Cross, Left, or Right
-                    if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
-                        ui_reset_host_selection();
-                        ui_state = UI_STATE_DISCOVERY;
-                    }
-                } else if (active_main_item == 1) {
-                    // Settings Submenu: Enter stream configuration menu
-                    if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
-                        ui_state = UI_STATE_SETTINGS;
-                        active_settings_item = 0; settings_scroll = 0;
-                    }
-                } else if (active_main_item == 2) {
-                    // Connect / Pair action button
-                    if (pad.buttons_pressed & A_FLAG) {
-                        ui_state = UI_STATE_PAIRING;
-                    }
-                } else if (active_main_item == 3) {
-                    // Quit the app the host says is running (main thread sends /cancel)
-                    if (pad.buttons_pressed & A_FLAG) quit_request = 1;
-                }
+        ui_draw_frame_begin();
+        if ((frame++ % 600) == 0) ui_theme_update();
 
-                // START button initiates connection immediately from anywhere in main menu
-                if (pad.buttons_pressed & PLAY_FLAG) {
-                    ui_state = UI_STATE_PAIRING;
-                }
-
-                // Circle button opens native PS3 confirmation dialog to exit to XMB
-                if (pad.buttons_pressed & B_FLAG) {
-                    ui_open_exit_dialog();
-                }
-            }
-        } else if (ui_state == UI_STATE_SETTINGS) {
-            // Vertical navigation across the scrolling settings list
-            if (pad.buttons_pressed & UP_FLAG) {
-                active_settings_item = (active_settings_item + SETTINGS_ITEM_COUNT - 1) % SETTINGS_ITEM_COUNT;
-            }
-            if (pad.buttons_pressed & DOWN_FLAG) {
-                active_settings_item = (active_settings_item + 1) % SETTINGS_ITEM_COUNT;
-            }
-            // L1 / R1 jump a page
-            if (pad.buttons_pressed & LB_FLAG) {
-                active_settings_item -= SETTINGS_VISIBLE - 1;
-                if (active_settings_item < 0) active_settings_item = 0;
-            }
-            if (pad.buttons_pressed & RB_FLAG) {
-                active_settings_item += SETTINGS_VISIBLE - 1;
-                if (active_settings_item >= SETTINGS_ITEM_COUNT) active_settings_item = SETTINGS_ITEM_COUNT - 1;
-            }
-            settings_clamp_scroll();
-
-            if (active_settings_item == SR_BACK) {
-                if (pad.buttons_pressed & A_FLAG) {
-                    ui_save_settings();
-                    ui_state = UI_STATE_IP_ENTRY;
-                }
-            } else {
-                int dir = 0;
-                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) dir = 1;
-                else if (pad.buttons_pressed & LEFT_FLAG) dir = -1;
-                if (dir && settings_change(active_settings_item, dir)) ui_save_settings();
-            }
-
-            // Circle button returns to main menu from anywhere in settings
-            if (pad.buttons_pressed & B_FLAG) {
-                ui_save_settings();
-                ui_state = UI_STATE_IP_ENTRY;
-            }
-        } else if (ui_state == UI_STATE_PAIRING) {
-            // Circle button to cancel pairing attempt
-            if (pad.buttons_pressed & B_FLAG) {
-                ui_state = UI_STATE_IP_ENTRY;
-            }
-        } else if (ui_state == UI_STATE_APPLIST) {
-            if (current_app_list.count > 0) {
-                if (pad.buttons_pressed & UP_FLAG) {
-                    active_app_idx = (active_app_idx + current_app_list.count - 1) % current_app_list.count;
-                }
-                if (pad.buttons_pressed & DOWN_FLAG) {
-                    active_app_idx = (active_app_idx + 1) % current_app_list.count;
-                }
-                if (pad.buttons_pressed & A_FLAG) {
-                    app_selection_confirmed = 1;
-                }
-            }
-            // Circle button returns to main menu
-            if (pad.buttons_pressed & B_FLAG) {
-				app_selection_confirmed = 0;
-				ui_state = UI_STATE_IP_ENTRY;
-			}
-        } else if (ui_state == UI_STATE_DISCOVERY) {
-            if (discovery_scanned) {
-                int total_rows = discovered_host_count + 1;
-                if (pad.buttons_pressed & UP_FLAG)
-                    active_host_idx = (active_host_idx + total_rows - 1) % total_rows;
-                if (pad.buttons_pressed & DOWN_FLAG)
-                    active_host_idx = (active_host_idx + 1) % total_rows;
-                if (pad.buttons_pressed & A_FLAG) {
-                    if (active_host_idx == discovered_host_count)
-                        manual_entry_requested = 1;
-                    else
-                        host_selection_confirmed = 1;
-                }
-            }
-            if (pad.buttons_pressed & B_FLAG) {
-                ui_reset_host_selection();
-                ui_state = UI_STATE_IP_ENTRY;
-            }
+        // The clear colour fills whatever the overscan viewport leaves bare, so
+        // it is the sky's middle stop in menus and black behind a stream (the
+        // colour of the bars round a stream whose shape does not match).
+        if (ui_state == UI_STATE_STREAMING) {
+            tiny3d_Clear(0x000000ff, TINY3D_CLEAR_ALL);
+        } else {
+            const ui_theme_t *t = ui_theme();
+            u32 c = ((u32)(t->bg_mid.r * 255.0f) << 24) | ((u32)(t->bg_mid.g * 255.0f) << 16) |
+                    ((u32)(t->bg_mid.b * 255.0f) << 8) | 0xff;
+            tiny3d_Clear(c, TINY3D_CLEAR_ALL);
         }
+
+        // Menus take no input while the OSK or a native dialog owns the pad.
+        ui_screens_input(ui_modal_active() ? &no_pad : &pad);
 
         if (show_stats) {
             u64 now = sysGetSystemTime();
@@ -1701,468 +1439,21 @@ static void ui_loop(void *arg) {
             frames_drawn_this_sec++;
         }
 
-        // 1. Draw UI / Video (Top 70%)
         ui_apply_overscan();
         tiny3d_UserViewportSurface(1, (float)ui_width, (float)ui_height);
         tiny3d_Project2D();
-        
-        // Ensure transparent alpha blending is active for all 2D text and menu overlays
         tiny3d_AlphaTest(1, 0, TINY3D_ALPHA_FUNC_GREATER);
-        tiny3d_BlendFunc(1, 
-            TINY3D_BLEND_FUNC_SRC_RGB_SRC_ALPHA | TINY3D_BLEND_FUNC_SRC_ALPHA_SRC_ALPHA,
-            TINY3D_BLEND_FUNC_DST_RGB_ONE_MINUS_SRC_ALPHA | TINY3D_BLEND_FUNC_DST_ALPHA_ONE_MINUS_SRC_ALPHA,
-            TINY3D_BLEND_RGB_FUNC_ADD | TINY3D_BLEND_ALPHA_FUNC_ADD);
-        
+        ui_blend_set(UI_BLEND_NORMAL);
+
         if (ui_state == UI_STATE_STREAMING) {
             ps3video_draw();
-            
-            // Draw Video Performance Stats HUD (Top Left) if enabled
-            if (show_stats) {
-                float sx = SX(30);
-                float sy = SY(30);
-                float line_h = SY(20);
-                float hud_w = SX(430);
-                float hud_h = 13.5f * line_h;
-
-                // Semi-transparent dark HUD container background (#121212 with 85% alpha)
-                tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-                tiny3d_VertexPos(sx - SX(10), sy - SY(10), 65535);
-                tiny3d_VertexFcolor(0.07f, 0.07f, 0.07f, 0.85f);
-                tiny3d_VertexPos(sx + hud_w, sy - SY(10), 65535);
-                tiny3d_VertexFcolor(0.07f, 0.07f, 0.07f, 0.85f);
-                tiny3d_VertexPos(sx - SX(10), sy + hud_h, 65535);
-                tiny3d_VertexFcolor(0.07f, 0.07f, 0.07f, 0.85f);
-                tiny3d_VertexPos(sx + hud_w, sy + hud_h, 65535);
-                tiny3d_VertexFcolor(0.07f, 0.07f, 0.07f, 0.85f);
-                tiny3d_End();
-
-                // Top Accent Line (#3F51B5)
-                tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-                tiny3d_VertexPos(sx - SX(10), sy - SY(10), 65535);
-                tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
-                tiny3d_VertexPos(sx + hud_w, sy - SY(10), 65535);
-                tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
-                tiny3d_VertexPos(sx - SX(10), sy - SY(8), 65535);
-                tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
-                tiny3d_VertexPos(sx + hud_w, sy - SY(8), 65535);
-                tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
-                tiny3d_End();
-
-                SetCurrentFont(0);
-                SetFontSize(SF(16), SF(16));
-                SetFontColor(0x00ff00ff, 0); // Pure Matrix Green (RGBA: RR=0, GG=255, BB=0, AA=255)
-
-                DrawFormatString(sx, sy + 0 * line_h, "Rendered FPS: %d", ps3video_get_current_fps());
-                DrawFormatString(sx, sy + 1 * line_h, "Decoded FPS: %d", ps3video_get_decoded_fps());
-                DrawFormatString(sx, sy + 2 * line_h, "UI Loop FPS: %d", ui_fps_actual);
-                DrawFormatString(sx, sy + 3 * line_h, "Decode Latency: %d ms", ps3video_get_decode_latency());
-                DrawFormatString(sx, sy + 4 * line_h, "Render Latency: %d ms", ps3video_get_render_latency());
-                DrawFormatString(sx, sy + 5 * line_h, "Network Latency: %d ms", ps3video_get_net_latency() / 2);
-                DrawFormatString(sx, sy + 6 * line_h, "Total Latency: %d ms", (ps3video_get_net_latency() / 2) + ps3video_get_decode_latency() + ps3video_get_render_latency());
-                DrawFormatString(sx, sy + 7 * line_h, "Resolution: %dx%d stream -> %dx%d screen",
-                                 ui_get_stream_width(), ui_get_stream_height(), ui_width, ui_height);
-                DrawFormatString(sx, sy + 8 * line_h, "Target FPS: %d FPS", ui_get_fps());
-                // Requested vs measured.  These two disagreeing is the whole
-                // signal: if "Received" sits below "Bitrate" while frames are
-                // being dropped, the selected step is above what this console
-                // can actually pull.
-                {
-                    extern volatile int ps3_video_rx_kbps;   // VideoStream.c
-                    extern volatile int ps3_video_rxq_bytes; // VideoStream.c
-                    int want = ui_get_bitrate();
-                    int got = ps3_video_rx_kbps;
-
-                    DrawFormatString(sx, sy + 9 * line_h, "Bitrate: %.1f Mbps  (rx %.1f, sock %d KB)",
-                                     (float)want / 1000.0f, (float)got / 1000.0f,
-                                     ps3_video_rxq_bytes / 1024);
-                    DrawFormatString(sx, sy + 10 * line_h, "Dropped frames: %u",
-                                     (unsigned)ps3video_get_dropped_frames());
-                }
-                
-                /* Real-time Hardware Telemetry Stream Link Activity Monitor */
-                u32 total_frames = ps3video_get_total_decoded_frames();
-                int pulse_phase = (int)((total_frames / 4) % 4);
-                const char* spinner = "";
-                switch (pulse_phase) {
-                    case 0: spinner = "[ - ]"; break;
-                    case 1: spinner = "[ \\ ]"; break;
-                    case 2: spinner = "[ | ]"; break;
-                    case 3: spinner = "[ / ]"; break;
-                }
-                DrawFormatString(sx, sy + 11 * line_h, "Stream Link: ACTIVE %s", spinner);
-                {
-                    int ach, ahq;
-                    unsigned adec, amax, aund;
-                    ps3audio_get_hud(&ach, &ahq, &adec, &amax, &aund);
-                    if (ach > 0)
-                        DrawFormatString(sx, sy + 12 * line_h,
-                                         "Audio: %s%s  decode %.2f / %.2f ms  underruns %u",
-                                         ach == 8 ? "7.1" : ach == 6 ? "5.1" : "Stereo",
-                                         ahq ? " HQ" : "", adec / 1000.0f, amax / 1000.0f, aund);
-                    else
-                        DrawString(sx, sy + 12 * line_h, "Audio: not running");
-                }
-            }
+            ui_blend_set(UI_BLEND_NORMAL);   // the video quad may have changed it
+            ui_screens_draw_hud();
         } else {
-            draw_background_gradient();
-            
-            if (ui_state == UI_STATE_IP_ENTRY) {
-                // Title inside #3F51B5 header bar
-                SetFontSize(SF(26), SF(26));
-                SetFontColor(0xffffffff, 0);
-                DrawString(SX(40), SY(18), "Moonlight PS3");
-                
-                // Row 0: Sunshine Host
-                SetFontSize(SF(24), SF(24));
-                SetFontColor((active_main_item == 0) ? 0xff82b1ff : 0xffb0bec5, 0);
-                float next_x = DrawString(SX(60), SY(125), "Sunshine Host:");
-                
-                SetFontColor((active_main_item == 0) ? 0xff82b1ff : 0xffffffff, 0);
-                {
-                    const ui_saved_host_t *sh = ui_get_saved_host(selected_host_idx);
-                    if (sh && sh->name[0] && strcmp(sh->name, "Manual Entry") != 0 &&
-                        strcmp(sh->name, sh->address) != 0)
-                        DrawFormatString(next_x + SX(20), SY(125), "[ %s (%s) ]", sh->name, target_ip_str);
-                    else
-                        DrawFormatString(next_x + SX(20), SY(125), "[ %s ]", target_ip_str);
-                    if (host_is_apollo) {
-                        SetFontSize(SF(16), SF(16));
-                        SetFontColor(0xff9e9e9e, 0);
-                        DrawString(SX(60), SY(152), "Vibepollo / Apollo host (virtual display available)");
-                    }
-                }
-
-                // Row 1: Settings Sub-menu Link
-                SetFontSize(SF(24), SF(24));
-                SetFontColor((active_main_item == 1) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawString(SX(60), SY(185), "[ CONFIGURE STREAM SETTINGS ]");
-                
-                // Active settings summary preview
-                SetFontSize(SF(18), SF(18));
-                SetFontColor(0xff9e9e9e, 0);
-                int kbps = ui_bitrate_options[ui_bitrate_idx];
-                if (kbps % 1000 == 0) {
-                    DrawFormatString(SX(60), SY(225), "Current: %dx%d  |  %d FPS  |  %d Mbps  |  Mouse: %s  |  VSync: %s", 
-                                     ui_get_stream_width(), ui_get_stream_height(),
-                                     ui_get_fps(), kbps / 1000, (ui_mouse_mode == 0) ? "GAME" : "DESKTOP", ui_vsync ? "ON" : "OFF");
-                } else {
-                    DrawFormatString(SX(60), SY(225), "Current: %dx%d  |  %d FPS  |  %.1f Mbps  |  Mouse: %s  |  VSync: %s", 
-                                     ui_get_stream_width(), ui_get_stream_height(),
-                                     ui_get_fps(), (float)kbps / 1000.0f, (ui_mouse_mode == 0) ? "GAME" : "DESKTOP", ui_vsync ? "ON" : "OFF");
-                }
-
-                // Row 2: Connect / Pair Action Button
-                SetFontSize(SF(24), SF(24));
-                SetFontColor((active_main_item == 2) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawString(SX(60), SY(280), "[ CONNECT / PAIR TO HOST ]");
-
-                // Row 3: only while the host reports an app running
-                if (host_running_app) {
-                    SetFontColor((active_main_item == 3) ? 0xff82b1ff : 0xffffffff, 0);
-                    if (host_running_name[0])
-                        DrawFormatString(SX(60), SY(335), "[ QUIT %s ON HOST ]", host_running_name);
-                    else
-                        DrawString(SX(60), SY(335), "[ QUIT RUNNING APP ON HOST ]");
-                }
-
-                // Clean controls legend
-                SetFontSize(SF(18), SF(18));
-                SetFontColor(0xff9e9e9e, 0);
-                DrawString(SX(60), SY(445), "\x05 Navigate   |   \x01 Select   |   \x02 Exit to XMB");
-            } else if (ui_state == UI_STATE_SETTINGS) {
-                // Title inside #3F51B5 header bar
-                SetFontSize(SF(26), SF(26));
-                SetFontColor(0xffffffff, 0);
-                DrawFormatString(SX(40), SY(18), "Moonlight PS3  -  %s",
-                                 settings_group_names[settings_group[active_settings_item]]);
-
-                // Scrolling list: SETTINGS_VISIBLE rows starting at settings_scroll.
-                SetFontSize(SF(20), SF(20));
-                for (int v = 0; v < SETTINGS_VISIBLE; v++) {
-                    int r = settings_scroll + v;
-                    if (r >= SETTINGS_ITEM_COUNT) break;
-                    float y = SY(100 + 35 * v);
-                    int active = (r == active_settings_item);
-                    if (r == SR_BACK) {
-                        SetFontColor(active ? 0xff82b1ff : 0xffffffff, 0);
-                        DrawString(SX(60), y, "[ BACK TO MAIN MENU ]");
-                        continue;
-                    }
-                    char val[80];
-                    settings_value_text(r, val, sizeof(val));
-                    SetFontColor(active ? 0xff82b1ff : 0xffb0bec5, 0);
-                    DrawString(SX(60), y, (char *)settings_labels[r]);
-                    SetFontColor(active ? 0xff82b1ff : 0xffffffff, 0);
-                    DrawFormatString(SX(430), y, "[ %s ]", val);
-                }
-
-                // Position and scroll hints
-                SetFontSize(SF(16), SF(16));
-                SetFontColor(0xff9e9e9e, 0);
-                DrawFormatString(SX(1090), SY(70), "%d / %d", active_settings_item + 1, SETTINGS_ITEM_COUNT);
-                if (settings_scroll > 0)
-                    DrawString(SX(1090), SY(88), "more above");
-                if (settings_scroll + SETTINGS_VISIBLE < SETTINGS_ITEM_COUNT)
-                    DrawString(SX(1090), SY(100 + 35 * SETTINGS_VISIBLE - 18), "more below");
-
-                // Clean controls legend
-                SetFontSize(SF(18), SF(18));
-                SetFontColor(0xff9e9e9e, 0);
-                DrawString(SX(60), SY(490), "\x05 Navigate   |   \x01 Select / Change   |   \x02 Back");
-            } else if (ui_state == UI_STATE_PAIRING) {
-                // Title inside #3F51B5 header bar
-                SetFontSize(SF(26), SF(26));
-                SetFontColor(0xffffffff, 0);
-                DrawString(SX(40), SY(18), "Moonlight PS3  -  Device Pairing");
-
-                if (pairing_pin_str[0] != '\0') {
-                    // Heading
-                    SetFontSize(SF(24), SF(24));
-                    SetFontColor(0xffffffff, 0);
-                    DrawString(SX(60), SY(110), "Sunshine Pairing Required");
-
-                    // Subheading instructions
-                    SetFontSize(SF(18), SF(18));
-                    SetFontColor(0xffb0bec5, 0);
-                    DrawString(SX(60), SY(150), "Open Sunshine Web UI (PIN Tab) and enter this PIN:");
-
-                    // PIN Badge Card Container (#1E1E1E background with #3F51B5 top accent line)
-                    tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-                    tiny3d_VertexPos(SX(60), SY(190), 65535);
-                    tiny3d_VertexFcolor(0.12f, 0.12f, 0.12f, 0.95f);
-                    tiny3d_VertexPos(SX(400), SY(190), 65535);
-                    tiny3d_VertexFcolor(0.12f, 0.12f, 0.12f, 0.95f);
-                    tiny3d_VertexPos(SX(60), SY(275), 65535);
-                    tiny3d_VertexFcolor(0.12f, 0.12f, 0.12f, 0.95f);
-                    tiny3d_VertexPos(SX(400), SY(275), 65535);
-                    tiny3d_VertexFcolor(0.12f, 0.12f, 0.12f, 0.95f);
-                    tiny3d_End();
-
-                    // Top Accent Line (#3F51B5)
-                    tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-                    tiny3d_VertexPos(SX(60), SY(190), 65535);
-                    tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
-                    tiny3d_VertexPos(SX(400), SY(190), 65535);
-                    tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
-                    tiny3d_VertexPos(SX(60), SY(193), 65535);
-                    tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
-                    tiny3d_VertexPos(SX(400), SY(193), 65535);
-                    tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
-                    tiny3d_End();
-
-                    // PIN Text in large bold highlight
-                    SetFontSize(SF(34), SF(34));
-                    SetFontColor(0xff82b1ff, 0); // Rose / Pink highlight
-                    DrawFormatString(SX(85), SY(218), "PIN:  %s", pairing_pin_str);
-
-                    // Waiting status
-                    SetFontSize(SF(18), SF(18));
-                    SetFontColor(0xff9e9e9e, 0);
-                    DrawString(SX(60), SY(305), "Waiting for confirmation from host...");
-                } else {
-                    SetFontSize(SF(24), SF(24));
-                    SetFontColor(0xff82b1ff, 0);
-                    DrawString(SX(60), SY(180), "Connecting to Sunshine Host...");
-
-                    SetFontSize(SF(18), SF(18));
-                    SetFontColor(0xffb0bec5, 0);
-                    DrawString(SX(60), SY(220), "Initializing handshake session...");
-                }
-
-                // Bottom cancel button legend
-                SetFontSize(SF(18), SF(18));
-                SetFontColor(0xff9e9e9e, 0);
-                DrawString(SX(60), SY(445), "\x02 Cancel Pairing");
-            } else if (ui_state == UI_STATE_APPLIST) {
-                // Title inside #3F51B5 header bar
-                SetFontSize(SF(26), SF(26));
-                SetFontColor(0xffffffff, 0);
-                DrawString(SX(40), SY(18), "Moonlight PS3  -  Host Applications");
-
-                // Subtitle
-                SetFontSize(SF(22), SF(22));
-                SetFontColor(0xffffffff, 0);
-                DrawString(SX(60), SY(95), "Select Game or Application to Stream:");
-
-                if (current_app_list.count > 0) {
-                    SetFontSize(SF(18), SF(18));
-                    SetFontColor(0xffb0bec5, 0);
-                    DrawFormatString(SX(480), SY(95), "[ %d / %d ]", active_app_idx + 1, current_app_list.count);
-
-                    // Render visible applications list
-                    #define MAX_VISIBLE_APPS 6
-                    int start_idx = 0;
-                    if (active_app_idx >= MAX_VISIBLE_APPS) {
-                        start_idx = active_app_idx - MAX_VISIBLE_APPS + 1;
-                    }
-                    int visible_count = current_app_list.count - start_idx;
-                    if (visible_count > MAX_VISIBLE_APPS) visible_count = MAX_VISIBLE_APPS;
-
-                    for (int i = 0; i < visible_count; i++) {
-                        int idx = start_idx + i;
-                        float row_y = SY(135) + (i * SY(48));
-
-                        if (idx == active_app_idx) {
-                            // Active selection card background (#242424 with pink accent border)
-                            tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-                            tiny3d_VertexPos(SX(55), row_y, 65535);
-                            tiny3d_VertexFcolor(0.16f, 0.16f, 0.16f, 0.95f);
-                            tiny3d_VertexPos(SX(850), row_y, 65535);
-                            tiny3d_VertexFcolor(0.16f, 0.16f, 0.16f, 0.95f);
-                            tiny3d_VertexPos(SX(55), row_y + SY(40), 65535);
-                            tiny3d_VertexFcolor(0.16f, 0.16f, 0.16f, 0.95f);
-                            tiny3d_VertexPos(SX(850), row_y + SY(40), 65535);
-                            tiny3d_VertexFcolor(0.16f, 0.16f, 0.16f, 0.95f);
-                            tiny3d_End();
-
-                            // Left Accent Line (#FF82B1)
-                            tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-                            tiny3d_VertexPos(SX(55), row_y, 65535);
-                            tiny3d_VertexFcolor(1.0f, 0.51f, 0.69f, 1.0f);
-                            tiny3d_VertexPos(SX(59), row_y, 65535);
-                            tiny3d_VertexFcolor(1.0f, 0.51f, 0.69f, 1.0f);
-                            tiny3d_VertexPos(SX(55), row_y + SY(40), 65535);
-                            tiny3d_VertexFcolor(1.0f, 0.51f, 0.69f, 1.0f);
-                            tiny3d_VertexPos(SX(59), row_y + SY(40), 65535);
-                            tiny3d_VertexFcolor(1.0f, 0.51f, 0.69f, 1.0f);
-                            tiny3d_End();
-
-                            SetFontSize(SF(22), SF(22));
-                            SetFontColor(0xff82b1ff, 0); // Pink highlight
-                            DrawFormatString(SX(70), row_y + SY(8), "[ > ]  %s", current_app_list.apps[idx].name);
-                        } else {
-                            SetFontSize(SF(20), SF(20));
-                            SetFontColor(0xffb0bec5, 0);
-                            DrawFormatString(SX(70), row_y + SY(8), "       %s", current_app_list.apps[idx].name);
-                        }
-                    }
-                } else {
-                    SetFontSize(SF(22), SF(22));
-                    SetFontColor(0xffff82b1, 0);
-                    DrawString(SX(60), SY(180), "No applications found on host.");
-                }
-
-                // Clean controls legend
-                SetFontSize(SF(18), SF(18));
-                SetFontColor(0xff9e9e9e, 0);
-                DrawString(SX(60), SY(445), "\x05 Navigate   |   \x01 Launch Game   |   \x02 Cancel");
-                } else if (ui_state == UI_STATE_DISCOVERY) {
-                SetFontSize(SF(26), SF(26));
-                SetFontColor(0xffffffff, 0);
-                DrawString(SX(40), SY(18), "Moonlight PS3  -  Find Host");
-
-                if (!discovery_scanned) {
-                    SetFontSize(SF(24), SF(24));
-                    SetFontColor(0xff82b1ff, 0);
-                    DrawString(SX(60), SY(180), "Scanning for Sunshine hosts on the LAN...");
-                } else {
-                    SetFontSize(SF(20), SF(20));
-                    SetFontColor(0xffb0bec5, 0);
-                    if (discovered_host_count == 0)
-                        DrawString(SX(60), SY(110), "No hosts found automatically.");
-                    else
-                        DrawFormatString(SX(60), SY(95), "Found %d host(s):", discovered_host_count);
-
-                    int total_rows = discovered_host_count + 1;
-                    for (int i = 0; i < total_rows; i++) {
-                        float row_y = SY(140) + (i * SY(40));
-                        char label_buf[96];
-                        if (i == discovered_host_count)
-                            snprintf(label_buf, sizeof(label_buf), "[ Enter IP manually... ]");
-                        else
-                            snprintf(label_buf, sizeof(label_buf), "%s  (%s)",
-                                     discovered_hosts[i].name, discovered_hosts[i].address);
-                        SetFontSize(SF(22), SF(22));
-                        SetFontColor((i == active_host_idx) ? 0xff82b1ff : 0xffffffff, 0);
-                        DrawFormatString(SX(70), row_y, "%s %s",
-                                        (i == active_host_idx) ? "[ > ]" : "     ", label_buf);
-                    }
-                }
-                SetFontSize(SF(18), SF(18));
-                SetFontColor(0xff9e9e9e, 0);
-                DrawString(SX(60), SY(445), "\x05 Navigate   |   \x01 Select   |   \x02 Back");
-			} else if (ui_state == UI_STATE_ERROR) {
-                SetFontSize(SF(26), SF(26));
-                SetFontColor(0xffff5252, 0);
-                DrawString(SX(60), SY(200), "ERROR: Target unreachable or Pairing failed.");
-                if (ui_error_detail[0]) {
-                    // The host's own reason (Vibepollo explains permission
-                    // refusals and what to change).  Wrapped by hand: the font
-                    // layer does not wrap.
-                    SetFontSize(SF(18), SF(18));
-                    SetFontColor(0xffffffff, 0);
-                    const int wrap = 70;
-                    const char *p = ui_error_detail;
-                    int line = 0;
-                    while (*p && line < 4) {
-                        char buf[80];
-                        int len = (int)strlen(p);
-                        int take = len > wrap ? wrap : len;
-                        if (take < len) {
-                            int sp = take;
-                            while (sp > 0 && p[sp] != ' ') sp--;
-                            if (sp > 0) take = sp;
-                        }
-                        memcpy(buf, p, (size_t)take);
-                        buf[take] = '\0';
-                        DrawString(SX(60), SY(235 + line * 24), buf);
-                        p += take;
-                        while (*p == ' ') p++;
-                        line++;
-                    }
-                    SetFontSize(SF(26), SF(26));
-                    SetFontColor(0xffff5252, 0);
-                }
-                DrawString(SX(60), SY(340), "Press \x01 to return.");
-                if (pad.buttons_pressed & A_FLAG) {
-                    ui_state = UI_STATE_IP_ENTRY;
-                    ui_error_detail[0] = '\0';
-                }
-            }
+            ui_bg_draw();
+            ui_screens_draw();
         }
-
-        // 2. Draw TTY Logs (Bottom 28%) - Only in Menus
-        if (ui_state != UI_STATE_STREAMING) {
-            char visible_logs[8][MAX_LOG_WIDTH];
-            int visible_log_count = 0;
-
-            if (log_mutex_initialized) sysMutexLock(log_mutex, 0);
-            int start_line = (log_count > 8) ? (log_count - 8) : 0;
-            for (int i = start_line; i < log_count; i++) {
-                memcpy(visible_logs[visible_log_count++], log_buffer[i], MAX_LOG_WIDTH);
-            }
-            if (log_mutex_initialized) sysMutexUnlock(log_mutex);
-
-            // Log container background (#1E1E1E)
-            tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-            tiny3d_VertexPos(0, ui_height * 0.72f, 65535);
-            tiny3d_VertexFcolor(0.118f, 0.118f, 0.118f, 0.95f);
-            tiny3d_VertexPos(ui_width, ui_height * 0.72f, 65535);
-            tiny3d_VertexFcolor(0.118f, 0.118f, 0.118f, 0.95f);
-            tiny3d_VertexPos(0, ui_height, 65535);
-            tiny3d_VertexFcolor(0.090f, 0.090f, 0.090f, 0.95f);
-            tiny3d_VertexPos(ui_width, ui_height, 65535);
-            tiny3d_VertexFcolor(0.090f, 0.090f, 0.090f, 0.95f);
-            tiny3d_End();
-
-            // Log header accent line (#3F51B5)
-            tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-            tiny3d_VertexPos(0, ui_height * 0.72f, 65535);
-            tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 0.8f);
-            tiny3d_VertexPos(ui_width, ui_height * 0.72f, 65535);
-            tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 0.8f);
-            tiny3d_VertexPos(0, (ui_height * 0.72f) + SY(2), 65535);
-            tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 0.8f);
-            tiny3d_VertexPos(ui_width, (ui_height * 0.72f) + SY(2), 65535);
-            tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 0.8f);
-            tiny3d_End();
-
-            SetFontSize(SF(16), SF(16));
-            SetFontColor(0xff80d8ff, 0); // Light Material Cyan/Blue for log readability
-            for (int i = 0; i < visible_log_count; i++) {
-                DrawString(SX(20), (ui_height * 0.73f) + (i * SY(19)), visible_logs[i]);
-            }
-        }
+        ui_screens_draw_overlays();
 
         tiny3d_Flip();
         ps3video_after_flip(); // YUV self-test screen capture (no-op unless armed)
@@ -2191,17 +1482,9 @@ void ui_shutdown() {
         sysThreadJoin(ui_thread, &retval);
         ui_thread_started = 0;
     }
-    if (ft_face) {
-        FT_Done_Face(ft_face);
-        ft_face = NULL;
-    }
-    if (ft_library) {
-        FT_Done_FreeType(ft_library);
-        ft_library = NULL;
-    }
+    ui_fonts_shutdown();
     if (log_mutex_initialized) {
         sysMutexDestroy(log_mutex);
         log_mutex_initialized = 0;
     }
 }
-
