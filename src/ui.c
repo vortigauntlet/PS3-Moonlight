@@ -1507,6 +1507,7 @@ static void ui_loop(void *arg) {
         } else {
             ui_bg_draw();
             ui_screens_draw();
+            ui_bg_draw_light();
         }
         ui_screens_draw_overlays();
 

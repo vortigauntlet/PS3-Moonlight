@@ -8,7 +8,7 @@ static const ui_theme_t day_theme = {
     0.16f,                         // gloss
     0.05f,                         // sheen
     0.22f,                         // wave
-    0.12f,                         // bubble rim
+    0.60f,                         // moon
     0.04f,                         // light shafts
     0
 };
@@ -22,8 +22,8 @@ static const ui_theme_t night_theme = {
     0.14f,
     0.10f,
     0.20f,
-    0.14f,
-    0.09f,
+    0.90f,
+    0.20f,
     1
 };
 

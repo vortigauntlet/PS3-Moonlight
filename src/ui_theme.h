@@ -45,7 +45,7 @@ typedef struct {
     float    gloss_a;        // top-half shine
     float    sheen_a;        // diagonal streak
     float    wave_a;
-    float    bubble_a;
+    float    moon_a;         // moon and moonlight strength
     float    rays_a;         // light shafts
     int      night;
 } ui_theme_t;

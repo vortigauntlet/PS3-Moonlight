@@ -18,7 +18,7 @@ A new look and a calmer set of screens. The streaming engine is unchanged.
 | | |
 | :--- | :--- |
 | **PCs are cards** | Each saved PC is a glass card with a status pill (Ready, Not paired, Playing a game). Add PC, Options and Remove PC replace the IP field. |
-| **Aero look, day and night** | Glossy glass over an aqua sky with an XMB-style wave and drifting bubbles. Night is a darker Aero. Settings > Screen > Theme: Auto (day 07:00-19:00 by the console clock), Day or Night. |
+| **Aero look, day and night** | Glossy glass over an aqua sky lit by a large moon, with an XMB-style wave. Night is a darker Aero. Settings > Screen > Theme: Auto (day 07:00-19:00 by the console clock), Day or Night. |
 | **Fits every output** | Menus are laid out on a 720-high canvas, 1280 wide for 16:9 and 960 wide for 4:3, inside a safe margin. 480, 576, 720 and 1080 outputs in either shape. |
 | **Settings you can read** | Six sections in plain words, each row with a one-line explanation. Engineer settings live under Advanced. |
 | **Friendlier errors and pairing** | A big PIN, what to do next, and the host's own reason when it says no. |

@@ -11,7 +11,7 @@ How the 2.0 menus are put together, and how to look at them without a console.
 | `ui_theme.[ch]` | palette, type scale, timings, Day / Night (Dark Aero) |
 | `ui_fonts.[ch]` | four faces in one texture block, advance tables, `ui_text*` |
 | `ui_draw.[ch]` | rounded rects, glass, glow, spinner, pill, logo, easing |
-| `ui_bg.[ch]` | sky, light shafts, two wave ribbons, bubbles |
+| `ui_bg.[ch]` | sky, the moon and its halo, two wave ribbons, a final wash of moonlight |
 | `ui_screens.[ch]` | one draw function per screen, plus the shared chrome |
 | `ui_internal.h` | what `ui.c` shares with `ui_screens.c` |
 
@@ -41,7 +41,7 @@ exact for the sizes drawn.
 
 Frutiger Aero (glass, aqua sky, bubbles, an XMB wave) with Dark Aero as the
 night theme: near-black blue glass, a cold cyan edge on the focused item,
-diagonal sheen, light shafts. The logo is the project's ring-and-spokes mark,
+diagonal sheen. A moon sits top right; its halo lights the sky and a faint additive wash over the finished screen lets the glass catch it. The logo is the project's ring-and-spokes mark,
 drawn from its SVG geometry.
 
 ## Previewing screens

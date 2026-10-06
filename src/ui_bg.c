@@ -27,25 +27,43 @@ static void sky(const ui_theme_t *t) {
     tiny3d_End();
 }
 
-// ---- light shafts (Dark Aero) ---------------------------------------------
+// ---- the moon ----------------------------------------------------------------
 
-static void rays(const ui_theme_t *t) {
-    if (t->rays_a <= 0.0f) return;
+static float moon_x(void) { return ui_lay.lw * 0.85f + 10.0f * sinf(ui_time() * 0.05f); }
+static float moon_y(void) { return 150.0f + 4.0f * sinf(ui_time() * 0.07f); }
+static float moon_breath(void) { return 0.92f + 0.08f * sinf(ui_time() * 0.45f); }
+
+// The glow the moon throws over the sky: three nested soft discs.
+static void moon_halo(const ui_theme_t *t) {
+    float mx = moon_x(), my = moon_y(), k = t->moon_a * moon_breath();
     ui_blend_set(UI_BLEND_ADD);
-    float w = ui_lay.lw;
-    float time = ui_time();
+    static const float radius[3] = { 1100.0f, 600.0f, 260.0f };
+    static const float alpha[3]  = { 0.13f, 0.12f, 0.16f };
     for (int i = 0; i < 3; i++) {
-        float phase = time * (0.05f + 0.02f * (float)i) + (float)i * 2.1f;
-        float a = t->rays_a * (0.65f + 0.35f * sinf(phase));
-        float x0 = w * (0.08f + 0.30f * (float)i) + 30.0f * sinf(phase * 0.7f);
-        float spread = 70.0f + 25.0f * (float)i;
-        float drift = 330.0f;
-        ui_col_t top = { 0.55f, 0.85f, 1.0f, a };
-        ui_col_t bot = { 0.55f, 0.85f, 1.0f, 0.0f };
-        float xy[8] = { x0, 0.0f, x0 + spread, 0.0f, x0 + spread + drift, UI_LH * 0.85f, x0 + drift, UI_LH * 0.85f };
-        ui_col_t col[4] = { top, top, bot, bot };
-        ui_quad(xy, col);
+        ui_col_t c = { 0.72f, 0.84f, 1.0f, alpha[i] * k };
+        ui_col_t e = { 0.72f, 0.84f, 1.0f, 0.0f };
+        ui_circle(mx, my, radius[i], c, e);
     }
+    ui_blend_set(UI_BLEND_NORMAL);
+}
+
+static void moon_disc(const ui_theme_t *t) {
+    float mx = moon_x(), my = moon_y(), r = 66.0f, k = t->moon_a;
+    ui_col_t bright = { 0.86f, 0.91f, 0.99f, 0.70f * k + 0.2f };
+    ui_col_t edge = { 0.58f, 0.68f, 0.86f, 0.70f * k + 0.2f };
+    ui_circle(mx, my, r, bright, edge);
+    // The maria: a few darker, softer patches.
+    static const float m[6][3] = { { -0.30f, -0.22f, 0.30f }, { 0.22f, -0.36f, 0.20f }, { 0.10f, 0.12f, 0.34f },
+                                   { -0.38f, 0.30f, 0.16f }, { 0.42f, 0.18f, 0.14f }, { -0.05f, 0.50f, 0.12f } };
+    for (int i = 0; i < 6; i++) {
+        ui_col_t c = { 0.38f, 0.47f, 0.66f, 0.42f * k };
+        ui_col_t e = { 0.38f, 0.47f, 0.66f, 0.0f };
+        ui_circle(mx + m[i][0] * r, my + m[i][1] * r, m[i][2] * r, c, e);
+    }
+    // A soft bloom round the disc, additive, with no visible edge.
+    ui_blend_set(UI_BLEND_ADD);
+    ui_col_t bc = { 0.8f, 0.9f, 1.0f, 0.16f * k }, be = { 0.8f, 0.9f, 1.0f, 0.0f };
+    ui_circle(mx, my, r * 1.9f, bc, be);
     ui_blend_set(UI_BLEND_NORMAL);
 }
 
@@ -87,42 +105,22 @@ static void wave(const ui_theme_t *t) {
     ui_blend_set(UI_BLEND_NORMAL);
 }
 
-// ---- bubbles ---------------------------------------------------------------
-
-typedef struct { float x, y0, r, speed, sway, phase; } bubble_t;
-static const bubble_t bubbles[10] = {
-    { 0.08f, 0.92f, 34.0f,  8.0f, 14.0f, 0.3f },
-    { 0.17f, 0.31f, 14.0f, 12.0f,  9.0f, 1.7f },
-    { 0.29f, 0.74f, 52.0f,  6.0f, 18.0f, 2.9f },
-    { 0.41f, 0.12f, 20.0f, 10.0f, 10.0f, 4.1f },
-    { 0.52f, 0.58f, 12.0f, 14.0f,  8.0f, 0.9f },
-    { 0.63f, 0.88f, 60.0f,  6.5f, 20.0f, 5.2f },
-    { 0.72f, 0.40f, 26.0f,  9.0f, 12.0f, 3.3f },
-    { 0.83f, 0.66f, 16.0f, 13.0f, 10.0f, 2.2f },
-    { 0.91f, 0.20f, 40.0f,  7.0f, 16.0f, 4.8f },
-    { 0.96f, 0.80f, 22.0f, 11.0f,  9.0f, 1.1f },
-};
-
-static void bubble_field(const ui_theme_t *t) {
-    float time = ui_time();
-    for (int i = 0; i < 10; i++) {
-        const bubble_t *b = &bubbles[i];
-        float span = UI_LH + 2.0f * b->r;
-        float y = fmodf(b->y0 * span - b->speed * time + span * 8.0f, span) - b->r;
-        float x = b->x * ui_lay.lw + b->sway * sinf(time * 0.35f + b->phase);
-        ui_col_t centre = { 0.85f, 0.95f, 1.0f, 0.03f };
-        ui_col_t rim = { 0.85f, 0.95f, 1.0f, t->bubble_a };
-        ui_circle(x, y, b->r, centre, rim);
-        ui_col_t spec = { 1.0f, 1.0f, 1.0f, 0.35f };
-        ui_col_t spec0 = { 1.0f, 1.0f, 1.0f, 0.0f };
-        ui_circle(x - b->r * 0.42f, y - b->r * 0.42f, b->r * 0.14f + 1.5f, spec, spec0);
-    }
-}
-
 void ui_bg_draw(void) {
     const ui_theme_t *t = ui_theme();
     sky(t);
-    rays(t);
+    moon_halo(t);
+    moon_disc(t);
     wave(t);
-    bubble_field(t);
+}
+
+// A last faint wash of moonlight over the finished screen, so the glass and
+// text pick it up too.  Additive, so it can only brighten.
+void ui_bg_draw_light(void) {
+    const ui_theme_t *t = ui_theme();
+    float mx = moon_x(), my = moon_y();
+    ui_blend_set(UI_BLEND_ADD);
+    ui_col_t c = { 0.70f, 0.82f, 1.0f, 0.055f * t->moon_a * moon_breath() };
+    ui_col_t e = { 0.70f, 0.82f, 1.0f, 0.0f };
+    ui_circle(mx, my, 1100.0f, c, e);
+    ui_blend_set(UI_BLEND_NORMAL);
 }
