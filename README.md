@@ -25,10 +25,14 @@ A new look and a calmer set of screens. The streaming engine is unchanged.
 | **Log on demand** | The permanent log pane is gone. SELECT slides the log up on any menu. |
 | **Toasts** | A PC that moved, a game that quit, a permission the host denies, and how to leave a stream all appear as short messages. |
 
+### Screens
+
 | | |
 | :--- | :--- |
-| ![Find a PC](docs/screenshots/2.0/720p-16x9-discovery.png) | ![Pairing](docs/screenshots/2.0/720p-16x9-pairing.png) |
-| ![Settings](docs/screenshots/2.0/720p-16x9-settings.png) | ![4:3 output](docs/screenshots/2.0/480-4x3-home.png) |
+| ![Choose a PC](docs/screenshots/2.0/1080p-16x9-home.png)<br>Choose a PC | ![Find a PC](docs/screenshots/2.0/720p-16x9-discovery.png)<br>Find a PC |
+| ![Pairing](docs/screenshots/2.0/720p-16x9-pairing.png)<br>Pairing | ![Error](docs/screenshots/2.0/720p-16x9-error.png)<br>When something goes wrong |
+| ![Settings](docs/screenshots/2.0/720p-16x9-settings.png)<br>Settings | ![Games](docs/screenshots/2.0/720p-16x9-games.png)<br>Games |
+| ![4:3 output](docs/screenshots/2.0/480-4x3-home.png)<br>4:3 standard-definition output | ![Stats overlay](docs/screenshots/2.0/1080p-16x9-stream.png)<br>Stats overlay |
 
 **Changed for 2.0:** START still connects to the focused PC, and Settings is a
 card at the end of the row. The games list is still a plain list. Fonts: see
