@@ -97,21 +97,22 @@ It cuts the socket buffer needed for zero loss by 4x. Simulated at 1080p30 /
 | 512 KB | 0.6% | 0% |
 | 1 MB   | 0% | 0% |
 
-On by default. There is no room left on the settings page, so to turn it off set
+On by default. Turn it off in Settings > Advanced > Intra refresh, or set
 `intra_refresh=0` in `/dev_hdd0/game/MNLT00001/USRDIR/config.ini`.
 
 ### Finding the ceiling on your console
 
 The highest step that works is a property of your PS3 and your network, not of
-this app — so measure it rather than assuming. Turn on **Stats Overlay** in
-Stream Settings and watch two numbers:
+this app — so measure it rather than assuming. Turn on **Performance overlay** in
+Settings > Screen and watch two numbers:
 
 ```
-Bitrate: 25.0 Mbps  (rx 24.7, sock 41 KB)
-Dropped frames: 0
+Bitrate (ask / rx):  25.0 / 24.7 Mbps
+Socket buffer:       41 KB
+Dropped frames:      0
 ```
 
-- `rx` tracking the selected bitrate with `Dropped frames` flat means the step
+- `rx` (the second number) tracking the selected bitrate with `Dropped frames` flat means the step
   is fine — try the next one up.
 - `rx` falling short while frames drop means that step is over the ceiling.
   Come back down one.

@@ -9,7 +9,42 @@ make high-bitrate streams fall over.
 
 ---
 
-## What's new
+## What's new in 2.0
+
+A new look and a calmer set of screens. The streaming engine is unchanged.
+
+![Choose a PC](docs/screenshots/2.0/720p-16x9-home.png)
+
+| | |
+| :--- | :--- |
+| **PCs are cards** | Each saved PC is a glass card with a status pill (Ready, Not paired, Playing a game). Add PC, Options and Remove PC replace the IP field. |
+| **Aero look, day and night** | Glossy glass over an aqua sky with an XMB-style wave and drifting bubbles. Night is a darker Aero. Settings > Screen > Theme: Auto (day 07:00-19:00 by the console clock), Day or Night. |
+| **Fits every output** | Menus are laid out on a 720-high canvas, 1280 wide for 16:9 and 960 wide for 4:3, inside a safe margin. 480, 576, 720 and 1080 outputs in either shape. |
+| **Settings you can read** | Six sections in plain words, each row with a one-line explanation. Engineer settings live under Advanced. |
+| **Friendlier errors and pairing** | A big PIN, what to do next, and the host's own reason when it says no. |
+| **Log on demand** | The permanent log pane is gone. SELECT slides the log up on any menu. |
+| **Toasts** | A PC that moved, a game that quit, a permission the host denies, and how to leave a stream all appear as short messages. |
+
+| | |
+| :--- | :--- |
+| ![Find a PC](docs/screenshots/2.0/720p-16x9-discovery.png) | ![Pairing](docs/screenshots/2.0/720p-16x9-pairing.png) |
+| ![Settings](docs/screenshots/2.0/720p-16x9-settings.png) | ![4:3 output](docs/screenshots/2.0/480-4x3-home.png) |
+
+**Changed for 2.0:** START still connects to the focused PC, and Settings is a
+card at the end of the row. The games list is still a plain list. Fonts: see
+[docs/FONTS.md](docs/FONTS.md). Screenshots are from the RPCS3 emulator, not a
+console.
+
+### Roadmap
+
+Ideas left for later 2.x releases: box art and a games shelf, quit-and-switch
+when another game is running, quality presets, Wake-on-LAN, per-PC online
+status, an in-stream overlay menu, XMB sound effects, localisation, renaming
+PCs, and hiding or favouriting games.
+
+---
+
+## What's new in 1.4
 
 | | |
 | :--- | :--- |
@@ -21,7 +56,7 @@ make high-bitrate streams fall over.
 | **Controller upgrades** | DS3 rumble, analog L2/R2 triggers, and the Square / Triangle swap fixed. |
 | **Easier pairing** | Pairing follows the host, not its IP address. The PS3 waits 10 minutes for you to type the PIN. |
 | **Clean exit** | Leaving a stream with the PS button now ends the session on the host too. |
-| **Scrolling Settings** | Grouped into Video, Network & Host, Controls and Display. Everything that used to need `config.ini` is a row. |
+| **Scrolling Settings** | Grouped into Video, Network & Host, Controls and Display (reorganised in 2.0). Everything that used to need `config.ini` is a row. |
 | **One-click host setup** | `tools\setup-host.cmd` configures the PC for you. |
 
 > **Status.** 1080p59.94, YUV colours, 40-50 Mbps streaming, and the PS-button
@@ -33,7 +68,7 @@ make high-bitrate streams fall over.
 
 ## Surround audio
 
-Settings > Network & Host > **Audio**: Stereo (default), 5.1 or 7.1.
+Settings > Sound > **Audio**: Stereo (default), 5.1 or 7.1.
 
 - Surround uses Moonlight's high-quality Opus mode (separate streams, 5 ms
   packets), which switches on automatically at 15 Mbps or more.
@@ -57,7 +92,7 @@ with the right settings does not, and takes about 31 ms per frame.
 Client settings that go with it:
 
 - **1080p, 60 FPS** (shown as 59.94, the PS3's real output rate).
-- **Decoder Output: YUV420**. The colours are correct as of this fork.
+- **Settings > Advanced > Decoder output: YUV (faster)**. The colours are correct as of this fork.
 - **Bitrate 40-50 Mbps.** The client asks the host for 80% of the setting, and
   x264 delivers well under that. Measured on Cyberpunk 2077: the 12.5 setting
   delivered about 5 Mbps; 50 delivered about 30 Mbps at a steady 60 fps with no
@@ -108,14 +143,14 @@ Wi-Fi stalling. Nothing on the PS3 can hide a link that stops.
 - **Auto resolution:** 4:3 SD gets 640x480 or 768x576, 16:9 SD gets 960x544, HD
   gets 720p.
 - **4:3 stream sizes:** 640x480, 768x576, 1024x768.
-- **Picture Shape:** Fit (black bars) or Stretch (`aspect_mode`).
+- **Settings > Picture > Aspect:** Fit (black bars) or Stretch (`aspect_mode`).
 - **Overscan** (`overscan_x`, `overscan_y` in %, `overscan_xoff`,
   `overscan_yoff`): shrinks and shifts menus and stream together so the edges
   survive a CRT. Defaults are 100% / 0, and 90% x 92% on an SD output.
 
 Settings saved by older versions keep their explicit frame rate and resolution;
-choose **Auto** in Settings to switch. Menus are still drawn 16:9, so they look
-squashed on a 4:3 set.
+choose **Auto** in Settings to switch. Menus follow the output shape (16:9 or
+4:3) and stay inside a safe margin, so they are not squashed on a 4:3 set.
 
 ---
 
@@ -129,8 +164,9 @@ squashed on a 4:3 set.
 - **Face buttons:** Square and Triangle now map to X and Y correctly.
 - **Host identity:** pairing is keyed on the host's `<uniqueid>`. A DHCP change or
   rename does not need a re-pair, and a host that moves is found again on the LAN.
-- **Quit app on host:** the main menu shows *Quit <app> on host* whenever the host
-  reports something running, even after a dropped connection or a client restart.
+- **Quit app on host:** the PC card shows *Playing <app>* and its Options (triangle)
+  offer *Quit <app> on PC* whenever the host reports something running, even after
+  a dropped connection or a client restart.
 - **Clean exit:** the PS button or the exit combo ends the host session. A dropped
   connection leaves it running so you can resume.
 - **Host discovery:** hosts on the LAN are found automatically over mDNS.
@@ -188,9 +224,10 @@ a Desktop mode (absolute 1:1), selectable in Settings.
    it to a FAT32 USB drive.
 2. On a jailbroken PS3 (CFW or HEN): **Game > Package Manager > Install Package
    Files > Standard**.
-3. Launch **Moonlight PS3**, select the Host IP row and enter your PC's address.
-4. Select **Connect / Pair to Host**. Type the on-screen PIN into the Sunshine web UI
-   under **PIN**. The PS3 waits up to 10 minutes.
+3. Launch **Moonlight PS3** and choose **Add PC**. Your PC should appear; if not,
+   choose **Enter IP address...**.
+4. Select the PC. Type the on-screen PIN into the Sunshine web UI under **PIN**.
+   The PS3 waits up to 10 minutes.
 5. **Vibepollo / Apollo:** a new device may only list and watch. Grant Launch,
    Controller, Mouse and Keyboard under **Client Management**, or run
    `tools\setup-host.cmd`.

@@ -963,8 +963,8 @@ void ui_screens_draw_hud(void) {
     }
 
     const int rows = 16;
-    const float rh = 25.0f, lab_w = 200.0f, pad = 22.0f;
-    float val_w = 330.0f;
+    const float rh = 25.0f, lab_w = 190.0f, pad = 22.0f;
+    float val_w = 410.0f;
     float w = pad * 2.0f + lab_w + val_w, h = pad * 2.0f + rh * (float)rows;
     float maxw = ui_lay.lw - 2.0f * UI_SAFE_X;
     if (w > maxw) { val_w -= (w - maxw); w = maxw; }
@@ -982,7 +982,7 @@ void ui_screens_draw_hud(void) {
             ui_col_t c = healthy ? UI_OK : UI_WARN;
             ui_circle(x + pad - 11.0f, ry + 12.0f, 5.0f, c, ui_col_a(c, 0.8f));
         }
-        if (i == 12) ui_spinner(x + pad + lab_w + 112.0f, ry + 12.0f, 9.0f, ui_time());
+        if (i == 12) ui_spinner(x + pad + lab_w + 140.0f, ry + 12.0f, 9.0f, ui_time());
     }
 }
 

@@ -1467,15 +1467,16 @@ static void ui_loop(void *arg) {
         ui_draw_frame_begin();
         if ((frame++ % 600) == 0) ui_theme_update();
 
-        // The clear colour fills whatever the overscan viewport leaves bare, so
-        // it is the sky's middle stop in menus and black behind a stream (the
-        // colour of the bars round a stream whose shape does not match).
+        // The clear colour (0xAARRGGBB) fills whatever the overscan viewport
+        // leaves bare, so it is the sky's middle stop in menus and black behind
+        // a stream (the colour of the bars round a stream whose shape does not
+        // match the screen).
         if (ui_state == UI_STATE_STREAMING) {
-            tiny3d_Clear(0x000000ff, TINY3D_CLEAR_ALL);
+            tiny3d_Clear(0xff000000, TINY3D_CLEAR_ALL);
         } else {
             const ui_theme_t *t = ui_theme();
-            u32 c = ((u32)(t->bg_mid.r * 255.0f) << 24) | ((u32)(t->bg_mid.g * 255.0f) << 16) |
-                    ((u32)(t->bg_mid.b * 255.0f) << 8) | 0xff;
+            u32 c = 0xff000000u | ((u32)(t->bg_mid.r * 255.0f) << 16) | ((u32)(t->bg_mid.g * 255.0f) << 8) |
+                    (u32)(t->bg_mid.b * 255.0f);
             tiny3d_Clear(c, TINY3D_CLEAR_ALL);
         }
 
