@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <ctype.h>
 #include <time.h>
 #include "video.h"
 #include "audio.h"
@@ -81,8 +82,8 @@ static void clock_string(char *out, size_t n) {
 static void draw_topbar(const char *title) {
     // A soft shade behind the bar keeps the clock readable over the wave.
     ui_rect(0.0f, 0.0f, ui_lay.lw, 120.0f, SHADE, BLACK_0);
-    ui_moon(ui_left() + 14.0f, 68.0f, 17.0f);
-    ui_text_fit(UI_FACE_HEAD, UI_T_CARD, ui_left() + 44.0f, 50.0f, UI_ALIGN_LEFT, UI_TEXT,
+    ui_logo(ui_left() + 18.0f, 68.0f, 20.0f);
+    ui_text_fit(UI_FACE_HEAD, UI_T_CARD, ui_left() + 52.0f, 50.0f, UI_ALIGN_LEFT, UI_TEXT,
                 ui_lay.lw * 0.5f, title ? title : "Moonlight");
     char clk[48];
     clock_string(clk, sizeof(clk));
@@ -149,31 +150,6 @@ static void draw_log_drawer(void) {
 // ===========================================================================
 // Shared widgets
 // ===========================================================================
-static unsigned hash_str(const char *s) {
-    unsigned h = 2166136261u;
-    for (; *s; s++) { h ^= (unsigned char)*s; h *= 16777619u; }
-    return h;
-}
-
-// HSV to RGB, all 0..1.
-static ui_col_t hsv(float h, float s, float v, float a) {
-    float r = v, g = v, b = v;
-    float hh = (h - floorf(h)) * 6.0f;
-    int i = (int)hh;
-    float f = hh - (float)i;
-    float p = v * (1.0f - s), q = v * (1.0f - s * f), t = v * (1.0f - s * (1.0f - f));
-    switch (i % 6) {
-    case 0: r = v; g = t; b = p; break;
-    case 1: r = q; g = v; b = p; break;
-    case 2: r = p; g = v; b = t; break;
-    case 3: r = p; g = q; b = v; break;
-    case 4: r = t; g = p; b = v; break;
-    default: r = v; g = p; b = q; break;
-    }
-    ui_col_t c = { r, g, b, a };
-    return c;
-}
-
 static void centre_message(const char *title, const char *body) {
     ui_text_shadow(UI_FACE_HEAD, UI_T_CARD, ui_centre(), 356.0f, UI_ALIGN_CENTER, UI_TEXT, title);
     if (body && *body)
@@ -442,69 +418,83 @@ static void draw_summary(float y) {
     }
 }
 
-static void draw_options_panel(void) {
-    opt_t = ui_approach(opt_t, opt_open ? 1.0f : 0.0f, 18.0f);
-    if (opt_t < 0.01f) return;
-    float e = opt_t;
-    float sa = ui_get_alpha();
+typedef struct { const char *label; int icon; ui_col_t col; } opt_row_t;
 
-    // Dim the shelf behind it.
-    ui_set_alpha(sa * e);
+// The XMB-style panel that slides in from the right, over a dimmed screen.
+static void draw_options_rows(const char *title, const opt_row_t *rows, int n, int sel, float t) {
+    float sa = ui_get_alpha();
+    ui_set_alpha(sa * t);
     ui_rect(0.0f, 0.0f, ui_lay.lw, UI_LH, ui_col_a(BLACK_0, 0.35f), ui_col_a(BLACK_0, 0.35f));
     ui_set_alpha(sa);
 
-    const ui_saved_host_t *h = ui_get_saved_host(home_focus);
-    if (!h) return;
-    int items[4];
-    int n = options_items(items);
     float pw = 380.0f, row_h = 58.0f;
-    float ph = 96.0f + (opt_info ? 4 : n) * row_h + 24.0f;
-    float px = ui_right() - pw + (1.0f - e) * (pw + UI_SAFE_X + 20.0f);
+    float ph = 96.0f + (float)n * row_h + 24.0f;
+    float px = ui_right() - pw + (1.0f - t) * (pw + UI_SAFE_X + 20.0f);
     float py = 128.0f;
     ui_glass(px, py, pw, ph, UI_R_CARD, 0.0f);
-
-    char name[64];
-    host_display_name(h, name, sizeof(name));
-    ui_text_fit(UI_FACE_HEAD, UI_T_CARD, px + 28.0f, py + 24.0f, UI_ALIGN_LEFT, UI_TEXT, pw - 56.0f, name);
+    ui_text_fit(UI_FACE_HEAD, UI_T_CARD, px + 28.0f, py + 24.0f, UI_ALIGN_LEFT, UI_TEXT, pw - 56.0f, title);
     ui_rect(px + 24.0f, py + 70.0f, pw - 48.0f, UI_STROKE, ui_col_a(UI_TEXT, 0.25f), ui_col_a(UI_TEXT, 0.10f));
-
-    if (opt_info) {
-        char l[96];
-        float y = py + 90.0f;
-        snprintf(l, sizeof(l), "Address   %s", h->address);
-        ui_text_fit(UI_FACE_BODY, UI_T_BODY, px + 28.0f, y, UI_ALIGN_LEFT, UI_TEXT, pw - 56.0f, l);
-        snprintf(l, sizeof(l), "Pairing   %s", h->paired ? "Paired" : "Not paired");
-        ui_text(UI_FACE_BODY, UI_T_BODY, px + 28.0f, y + 44.0f, UI_ALIGN_LEFT, h->paired ? UI_OK : UI_WARN, l);
-        if (host_is_apollo && home_focus == ui_get_selected_host_index())
-            ui_text_fit(UI_FACE_BODY, UI_T_SECOND, px + 28.0f, y + 88.0f, UI_ALIGN_LEFT, UI_TEXT_2,
-                        pw - 56.0f, "Vibepollo / Apollo host");
-        else
-            ui_text(UI_FACE_BODY, UI_T_SECOND, px + 28.0f, y + 88.0f, UI_ALIGN_LEFT, UI_TEXT_3,
-                    h->uuid[0] ? "Remembered by its own ID" : "Not contacted yet");
-        return;
-    }
-
     for (int i = 0; i < n; i++) {
-        float ry = py + 86.0f + i * row_h;
-        int focus = (i == opt_item);
-        char label[96];
-        int icon = UI_ICON_INFO;
-        switch (items[i]) {
-        case OP_CONNECT: snprintf(label, sizeof(label), "Connect"); icon = UI_ICON_PLAY; break;
-        case OP_QUIT:
-            snprintf(label, sizeof(label), "Quit %s on PC", host_running_name[0] ? host_running_name : "game");
-            icon = UI_ICON_STOP; break;
-        case OP_INFO:    snprintf(label, sizeof(label), "PC info"); icon = UI_ICON_INFO; break;
-        default:         snprintf(label, sizeof(label), "Remove PC"); icon = UI_ICON_DELETE; break;
-        }
+        float ry = py + 86.0f + (float)i * row_h;
+        int focus = (i == sel);
         if (focus) {
             ui_glass(px + 14.0f, ry, pw - 28.0f, row_h - 8.0f, UI_R_ROW, 1.0f);
             ui_glow(px + 14.0f, ry, pw - 28.0f, row_h - 8.0f, UI_R_ROW, ui_glow_breath());
         }
-        ui_icon(icon, px + 48.0f, ry + (row_h - 8.0f) * 0.5f, 30.0f,
-                items[i] == OP_REMOVE ? UI_BAD : (focus ? UI_ACCENT : UI_TEXT_2));
-        ui_text_fit(UI_FACE_BODY, UI_T_BODY, px + 76.0f, ry + 11.0f, UI_ALIGN_LEFT, UI_TEXT, pw - 100.0f, label);
+        ui_icon(rows[i].icon, px + 48.0f, ry + (row_h - 8.0f) * 0.5f, 30.0f,
+                focus && rows[i].col.r == UI_TEXT_2.r ? UI_ACCENT : rows[i].col);
+        ui_text_fit(UI_FACE_BODY, UI_T_BODY, px + 76.0f, ry + 16.0f, UI_ALIGN_LEFT, UI_TEXT, pw - 100.0f, rows[i].label);
     }
+}
+
+static void draw_options_info(const ui_saved_host_t *h, float t) {
+    float sa = ui_get_alpha();
+    ui_set_alpha(sa * t);
+    ui_rect(0.0f, 0.0f, ui_lay.lw, UI_LH, ui_col_a(BLACK_0, 0.35f), ui_col_a(BLACK_0, 0.35f));
+    ui_set_alpha(sa);
+    float pw = 380.0f, ph = 96.0f + 4.0f * 58.0f + 24.0f;
+    float px = ui_right() - pw + (1.0f - t) * (pw + UI_SAFE_X + 20.0f), py = 128.0f;
+    ui_glass(px, py, pw, ph, UI_R_CARD, 0.0f);
+    char name[64];
+    host_display_name(h, name, sizeof(name));
+    ui_text_fit(UI_FACE_HEAD, UI_T_CARD, px + 28.0f, py + 24.0f, UI_ALIGN_LEFT, UI_TEXT, pw - 56.0f, name);
+    ui_rect(px + 24.0f, py + 70.0f, pw - 48.0f, UI_STROKE, ui_col_a(UI_TEXT, 0.25f), ui_col_a(UI_TEXT, 0.10f));
+    char l[96];
+    float y = py + 92.0f;
+    snprintf(l, sizeof(l), "Address   %s", h->address);
+    ui_text_fit(UI_FACE_BODY, UI_T_BODY, px + 28.0f, y, UI_ALIGN_LEFT, UI_TEXT, pw - 56.0f, l);
+    snprintf(l, sizeof(l), "Pairing   %s", h->paired ? "Paired" : "Not paired");
+    ui_text(UI_FACE_BODY, UI_T_BODY, px + 28.0f, y + 46.0f, UI_ALIGN_LEFT, h->paired ? UI_OK : UI_WARN, l);
+    if (host_is_apollo && home_focus == ui_get_selected_host_index())
+        ui_text_fit(UI_FACE_BODY, UI_T_SECOND, px + 28.0f, y + 92.0f, UI_ALIGN_LEFT, UI_TEXT_2, pw - 56.0f,
+                    "Vibepollo / Apollo host");
+    else
+        ui_text(UI_FACE_BODY, UI_T_SECOND, px + 28.0f, y + 92.0f, UI_ALIGN_LEFT, UI_TEXT_3,
+                h->uuid[0] ? "Remembered by its own ID" : "Not contacted yet");
+}
+
+static void draw_options_panel(void) {
+    opt_t = ui_approach(opt_t, opt_open ? 1.0f : 0.0f, 18.0f);
+    if (opt_t < 0.01f) return;
+    const ui_saved_host_t *h = ui_get_saved_host(home_focus);
+    if (!h) return;
+    if (opt_info) { draw_options_info(h, opt_t); return; }
+    int items[4];
+    int n = options_items(items);
+    opt_row_t rows[4];
+    char quit[96];
+    snprintf(quit, sizeof(quit), "Quit %s on PC", host_running_name[0] ? host_running_name : "game");
+    for (int i = 0; i < n; i++) {
+        switch (items[i]) {
+        case OP_CONNECT: rows[i] = (opt_row_t){ "Connect", UI_ICON_PLAY, UI_TEXT_2 }; break;
+        case OP_QUIT:    rows[i] = (opt_row_t){ quit, UI_ICON_STOP, UI_BAD }; break;
+        case OP_INFO:    rows[i] = (opt_row_t){ "PC info", UI_ICON_INFO, UI_TEXT_2 }; break;
+        default:         rows[i] = (opt_row_t){ "Remove PC", UI_ICON_DELETE, UI_BAD }; break;
+        }
+    }
+    char name[64];
+    host_display_name(h, name, sizeof(name));
+    draw_options_rows(name, rows, n, opt_item, opt_t);
 }
 
 static void draw_home(void) {
@@ -626,12 +616,12 @@ static void draw_discovery(void) {
             if (focus) ui_glow(x, y, w, row_h, UI_R_ROW, ui_glow_breath());
             if (i == discovered_host_count) {
                 ui_icon(UI_ICON_ADD, x + 44.0f, y + row_h * 0.5f, 40.0f, focus ? UI_ACCENT : UI_TEXT_2);
-                ui_text(UI_FACE_BODY, UI_T_BODY, x + 90.0f, y + 22.0f, UI_ALIGN_LEFT, UI_TEXT, "Enter IP address...");
+                ui_text(UI_FACE_BODY, UI_T_BODY, x + 90.0f, y + 28.0f, UI_ALIGN_LEFT, UI_TEXT, "Enter IP address...");
             } else {
                 ui_icon(UI_ICON_COMPUTER, x + 44.0f, y + row_h * 0.5f, 44.0f, focus ? UI_ACCENT : UI_TEXT_2);
-                ui_text_fit(UI_FACE_HEAD, UI_T_CARD, x + 90.0f, y + 12.0f, UI_ALIGN_LEFT, UI_TEXT,
+                ui_text_fit(UI_FACE_HEAD, UI_T_CARD, x + 90.0f, y + 17.0f, UI_ALIGN_LEFT, UI_TEXT,
                             w - 90.0f - 220.0f, discovered_hosts[i].name);
-                ui_text(UI_FACE_BODY, UI_T_SECOND, x + w - 24.0f, y + 24.0f, UI_ALIGN_RIGHT, UI_TEXT_2,
+                ui_text(UI_FACE_BODY, UI_T_SECOND, x + w - 24.0f, y + 22.0f, UI_ALIGN_RIGHT, UI_TEXT_2,
                         discovered_hosts[i].address);
             }
         }
@@ -645,49 +635,61 @@ static void draw_discovery(void) {
 }
 
 // ===========================================================================
-// Pairing, games, error, settings, HUD: ported first, restyled in later phases
+// Pairing / connecting
 // ===========================================================================
+static void selected_host_name(char *out, size_t n) {
+    const ui_saved_host_t *h = ui_get_saved_host(ui_get_selected_host_index());
+    if (h) host_display_name(h, out, n);
+    else snprintf(out, n, "your PC");
+}
+
 static void pairing_input(const ps3_pad_state_t *p) {
     if (p->buttons_pressed & B_FLAG) ui_set_state(UI_STATE_IP_ENTRY);
 }
 
 static void draw_pairing(void) {
+    char name[64];
+    selected_host_name(name, sizeof(name));
     draw_topbar("Moonlight");
-    if (pairing_pin_str[0]) {
-        char l[64];
-        snprintf(l, sizeof(l), "PIN  %s", pairing_pin_str);
-        centre_message(l, "Open the Sunshine web page, choose PIN, and enter this code.");
+
+    if (!pairing_pin_str[0]) {
+        char m[120];
+        snprintf(m, sizeof(m), "Connecting to %s...", name);
+        ui_spinner(ui_centre(), 300.0f, 42.0f, ui_time());
+        ui_text_fit(UI_FACE_HEAD, UI_T_CARD, ui_centre(), 380.0f, UI_ALIGN_CENTER, UI_TEXT,
+                    ui_lay.lw - 2.0f * UI_SAFE_X, m);
     } else {
-        centre_message("Connecting...", NULL);
+        float w = 660.0f, h = 420.0f;
+        float x = ui_centre() - w * 0.5f, y = 120.0f;
+        ui_glass(x, y, w, h, UI_R_CARD, 0.0f);
+        char t[120];
+        snprintf(t, sizeof(t), "Pair with %s", name);
+        ui_text_fit(UI_FACE_HEAD, 34.0f, ui_centre(), y + 28.0f, UI_ALIGN_CENTER, UI_TEXT, w - 56.0f, t);
+
+        // The four digits, each in a glass box.
+        const float bw = 100.0f, bh = 124.0f, bg = 20.0f;
+        float bx = ui_centre() - (4.0f * bw + 3.0f * bg) * 0.5f, by = y + 94.0f;
+        for (int i = 0; i < 4; i++) {
+            float x0 = bx + (float)i * (bw + bg);
+            ui_glass(x0, by, bw, bh, UI_R_ROW, 0.5f);
+            char d[2] = { pairing_pin_str[i] ? pairing_pin_str[i] : ' ', 0 };
+            ui_text_shadow(UI_FACE_DISPLAY, UI_T_PIN, x0 + bw * 0.5f, by + 20.0f, UI_ALIGN_CENTER, UI_ACCENT, d);
+        }
+        ui_text_wrap(UI_FACE_BODY, UI_T_SECOND, ui_centre(), y + 244.0f, UI_ALIGN_CENTER, UI_TEXT_2,
+                     w - 80.0f, 30.0f, 3,
+                     "On your PC, open the Sunshine (or Apollo) web page, choose PIN, and enter this code.");
+        float sw = ui_text_width(UI_FACE_BODY, UI_T_SECOND, "Waiting for your PC...");
+        float sx = ui_centre() - (sw + 44.0f) * 0.5f;
+        ui_spinner(sx + 14.0f, y + h - 44.0f, 14.0f, ui_time());
+        ui_text(UI_FACE_BODY, UI_T_SECOND, sx + 44.0f, y + h - 58.0f, UI_ALIGN_LEFT, UI_TEXT, "Waiting for your PC...");
     }
     foot_t foot[2] = { F_CIRCLE("Cancel"), F_KEY("SELECT", "Log") };
     draw_footer(foot, 2);
 }
 
-static void applist_input(const ps3_pad_state_t *p) {
-    if (current_app_list.count > 0) {
-        if (p->buttons_pressed & LEFT_FLAG)
-            active_app_idx = (active_app_idx + current_app_list.count - 1) % current_app_list.count;
-        if (p->buttons_pressed & RIGHT_FLAG)
-            active_app_idx = (active_app_idx + 1) % current_app_list.count;
-        if (p->buttons_pressed & A_FLAG) app_selection_confirmed = 1;
-    }
-    if (p->buttons_pressed & B_FLAG) {
-        app_selection_confirmed = 0;
-        ui_set_state(UI_STATE_IP_ENTRY);
-    }
-}
-
-static void draw_applist(void) {
-    draw_topbar("Moonlight");
-    draw_title("Games");
-    if (current_app_list.count > 0)
-        ui_text_fit(UI_FACE_HEAD, UI_T_CARD, ui_centre(), 320.0f, UI_ALIGN_CENTER, UI_TEXT, 700.0f,
-                    current_app_list.apps[active_app_idx].name);
-    foot_t foot[3] = { F_CROSS("Play"), F_CIRCLE("Back"), F_KEY("SELECT", "Log") };
-    draw_footer(foot, 3);
-}
-
+// ===========================================================================
+// Error
+// ===========================================================================
 static void error_input(const ps3_pad_state_t *p) {
     if (p->buttons_pressed & A_FLAG) {
         ui_set_state(UI_STATE_IP_ENTRY);
@@ -696,13 +698,124 @@ static void error_input(const ps3_pad_state_t *p) {
 }
 
 static void draw_error(void) {
+    char name[64], title[120];
+    selected_host_name(name, sizeof(name));
+    if (ui_error_detail[0]) snprintf(title, sizeof(title), "%s said no", name);
+    else snprintf(title, sizeof(title), "Couldn't connect to %s", name);
     draw_topbar("Moonlight");
-    centre_message("Couldn't connect", ui_error_detail);
-    foot_t foot[2] = { F_CROSS("OK"), F_KEY("SELECT", "Log") };
+
+    float w = 700.0f;
+    if (w > ui_lay.lw - 2.0f * UI_SAFE_X) w = ui_lay.lw - 2.0f * UI_SAFE_X;
+    float inner = w - 72.0f;
+    int detail_lines = 0;
+    if (ui_error_detail[0]) detail_lines = 4;
+    float h = 28.0f + 70.0f + 50.0f + (detail_lines ? detail_lines * 30.0f + 14.0f : 0.0f) + 24.0f + 2.0f * 34.0f - 4.0f;
+    float x = ui_centre() - w * 0.5f, y = 112.0f;
+    ui_glass(x, y, w, h, UI_R_CARD, 0.0f);
+
+    float cy = y + 28.0f;
+    ui_icon(UI_ICON_ERROR, ui_centre(), cy + 32.0f, 64.0f, UI_BAD);
+    cy += 70.0f;
+    ui_text_fit(UI_FACE_HEAD, 34.0f, ui_centre(), cy, UI_ALIGN_CENTER, UI_TEXT, inner, title);
+    cy += 50.0f;
+    if (ui_error_detail[0]) {
+        int used = ui_text_wrap(UI_FACE_BODY, UI_T_SECOND, ui_centre(), cy, UI_ALIGN_CENTER, UI_TEXT,
+                                inner, 30.0f, detail_lines, ui_error_detail);
+        cy += (float)used * 30.0f + 14.0f;
+    }
+    cy += 24.0f;
+    static const char *tips[2] = { "Is the PC on and Sunshine running?", "Is it on the same network?" };
+    for (int i = 0; i < 2; i++) {
+        ui_circle(x + 56.0f, cy + 12.0f + (float)i * 34.0f, 4.0f, UI_ACCENT, UI_ACCENT);
+        ui_text_fit(UI_FACE_BODY, UI_T_SECOND, x + 74.0f, cy + (float)i * 34.0f, UI_ALIGN_LEFT, UI_TEXT_2,
+                    inner - 24.0f, tips[i]);
+    }
+    foot_t foot[2] = { F_CROSS("OK"), F_KEY("SELECT", "Show log") };
     draw_footer(foot, 2);
 }
 
-static int set_cat, set_row, set_in_pane;
+// ===========================================================================
+// Games: a plain list.  Box art, a shelf and per-game options are later work.
+// ===========================================================================
+static float app_first_f;
+static float app_start_t;
+
+static void applist_enter(void) {
+    app_first_f = 0.0f;
+    app_start_t = 0.0f;
+}
+
+static void applist_input(const ps3_pad_state_t *p) {
+    if (app_selection_confirmed) return;        // launching: nothing to do but wait
+    int n = current_app_list.count;
+    if (n > 0) {
+        if (p->buttons_pressed & UP_FLAG)   active_app_idx = (active_app_idx + n - 1) % n;
+        if (p->buttons_pressed & DOWN_FLAG) active_app_idx = (active_app_idx + 1) % n;
+        if (p->buttons_pressed & A_FLAG)    app_selection_confirmed = 1;
+    }
+    if (p->buttons_pressed & B_FLAG) {
+        app_selection_confirmed = 0;
+        ui_set_state(UI_STATE_IP_ENTRY);
+    }
+}
+
+static void draw_applist(void) {
+    char hname[64];
+    selected_host_name(hname, sizeof(hname));
+    draw_topbar(hname);
+    draw_title("Games");
+
+    int n = current_app_list.count;
+    if (n <= 0) {
+        centre_message("No games found", "Add an application in Sunshine, then come back.");
+    } else {
+        active_app_idx = clampi(active_app_idx, 0, n - 1);
+        const float row_h = 56.0f, gap = 10.0f, top = 168.0f;
+        int vis = (int)((ui_bottom() - 70.0f - top + gap) / (row_h + gap));
+        if (vis < 1) vis = 1;
+        static int first = 0;
+        first = ui_shelf_first(active_app_idx, first, vis, n);
+        app_first_f = ui_approach(app_first_f, (float)first, UI_FOCUS_K);
+        float w = ui_right() - ui_left();
+        if (w > 760.0f) w = 760.0f;
+        for (int i = 0; i < n; i++) {
+            float y = top + ((float)i - app_first_f) * (row_h + gap);
+            if (y < top - row_h * 0.5f || y + row_h > top + (float)vis * (row_h + gap) + row_h * 0.5f) continue;
+            int focus = (i == active_app_idx);
+            ui_glass(ui_left(), y, w, row_h, UI_R_ROW, focus ? 1.0f : 0.0f);
+            if (focus) ui_glow(ui_left(), y, w, row_h, UI_R_ROW, ui_glow_breath());
+            ui_text_fit(UI_FACE_BODY, UI_T_BODY, ui_left() + 24.0f, y + 20.0f, UI_ALIGN_LEFT,
+                        focus ? UI_TEXT : UI_TEXT_2, w - 120.0f, current_app_list.apps[i].name);
+        }
+        char pos[24];
+        snprintf(pos, sizeof(pos), "%d / %d", active_app_idx + 1, n);
+        ui_text(UI_FACE_BODY, UI_T_SECOND, ui_left() + w, 122.0f, UI_ALIGN_RIGHT, UI_TEXT_3, pos);
+    }
+
+    if (app_selection_confirmed) {
+        app_start_t = clampf(app_start_t + ui_dt() / 0.25f, 0.0f, 1.0f);
+        ui_col_t dim = { 0.0f, 0.02f, 0.06f, 0.62f * app_start_t };
+        ui_rect(0.0f, 0.0f, ui_lay.lw, UI_LH, dim, dim);
+        float sa = ui_get_alpha();
+        ui_set_alpha(sa * app_start_t);
+        ui_spinner(ui_centre(), 330.0f, 44.0f, ui_time());
+        char m[160];
+        snprintf(m, sizeof(m), "Starting %s...", current_app_list.apps[active_app_idx].name);
+        ui_text_fit(UI_FACE_HEAD, 32.0f, ui_centre(), 412.0f, UI_ALIGN_CENTER, UI_TEXT,
+                    ui_lay.lw - 2.0f * UI_SAFE_X, m);
+        ui_set_alpha(sa);
+    } else {
+        foot_t foot[3] = { F_CROSS("Play"), F_CIRCLE("Back"), F_KEY("SELECT", "Log") };
+        draw_footer(foot, 3);
+    }
+}
+
+// ===========================================================================
+// Settings: categories on the left, rows on the right, help underneath
+// ===========================================================================
+static int   set_cat, set_row, set_in_pane;
+static float set_cat_f[8];
+static int   set_first;
 
 static void settings_input(const ps3_pad_state_t *p) {
     int ncat = ui_settings_cat_count();
@@ -711,15 +824,15 @@ static void settings_input(const ps3_pad_state_t *p) {
     if (!set_in_pane) {
         if (p->buttons_pressed & UP_FLAG)   set_cat = (set_cat + ncat - 1) % ncat;
         if (p->buttons_pressed & DOWN_FLAG) set_cat = (set_cat + 1) % ncat;
-        if (p->buttons_pressed & (RIGHT_FLAG | A_FLAG)) { set_in_pane = 1; set_row = 0; }
+        if (p->buttons_pressed & (RIGHT_FLAG | A_FLAG)) { set_in_pane = 1; set_row = 0; set_first = 0; }
     } else {
         if (p->buttons_pressed & UP_FLAG)   set_row = (set_row + nrows - 1) % nrows;
         if (p->buttons_pressed & DOWN_FLAG) set_row = (set_row + 1) % nrows;
         if (p->buttons_pressed & LEFT_FLAG) ui_settings_change(rows[set_row], -1);
         if (p->buttons_pressed & (RIGHT_FLAG | A_FLAG)) ui_settings_change(rows[set_row], 1);
     }
-    if (p->buttons_pressed & LB_FLAG) { set_cat = (set_cat + ncat - 1) % ncat; set_row = 0; }
-    if (p->buttons_pressed & RB_FLAG) { set_cat = (set_cat + 1) % ncat; set_row = 0; }
+    if (p->buttons_pressed & LB_FLAG) { set_cat = (set_cat + ncat - 1) % ncat; set_row = 0; set_first = 0; }
+    if (p->buttons_pressed & RB_FLAG) { set_cat = (set_cat + 1) % ncat; set_row = 0; set_first = 0; }
     if (p->buttons_pressed & B_FLAG) {
         if (set_in_pane) set_in_pane = 0;
         else { ui_save_settings(); ui_set_state(UI_STATE_IP_ENTRY); }
@@ -729,26 +842,148 @@ static void settings_input(const ps3_pad_state_t *p) {
 static void draw_settings(void) {
     draw_topbar("Moonlight");
     draw_title("Settings");
+
+    int ncat = ui_settings_cat_count();
+    float rail_w = ui_lay.lw > 1100.0f ? 300.0f : 236.0f;
+    float rx = ui_left(), top = 168.0f;
+    for (int c = 0; c < ncat; c++) {
+        float target = (c == set_cat) ? (set_in_pane ? 0.55f : 1.0f) : 0.0f;
+        set_cat_f[c] = ui_approach(set_cat_f[c], target, UI_FOCUS_K);
+        float y = top + (float)c * 62.0f;
+        ui_glass(rx, y, rail_w, 54.0f, UI_R_ROW, set_cat_f[c]);
+        if (c == set_cat && !set_in_pane) ui_glow(rx, y, rail_w, 54.0f, UI_R_ROW, ui_glow_breath());
+        ui_text(UI_FACE_BODY, UI_T_BODY, rx + 24.0f, y + 19.0f, UI_ALIGN_LEFT,
+                c == set_cat ? UI_TEXT : UI_TEXT_2, ui_settings_cat_name(c));
+    }
+
+    float px = rx + rail_w + 28.0f, pw = ui_right() - px;
     const int *rows;
     int nrows = ui_settings_cat_rows(set_cat, &rows);
-    for (int i = 0; i < nrows; i++) {
-        char v[64];
-        ui_settings_value(rows[i], v, sizeof(v));
-        float y = 180.0f + i * 44.0f;
-        ui_text(UI_FACE_BODY, UI_T_BODY, ui_left(), y, UI_ALIGN_LEFT,
-                (set_in_pane && i == set_row) ? UI_ACCENT : UI_TEXT, ui_settings_label(rows[i]));
-        ui_text(UI_FACE_BODY, UI_T_BODY, ui_right(), y, UI_ALIGN_RIGHT, UI_TEXT_2, v);
+    ui_text(UI_FACE_HEAD, UI_T_CARD, px, 138.0f, UI_ALIGN_LEFT, UI_TEXT, ui_settings_cat_name(set_cat));
+    const char *note = ui_settings_cat_note(set_cat);
+    float ry0 = 184.0f;
+    if (note[0]) {
+        ui_text_fit(UI_FACE_BODY, UI_T_MIN, px, 178.0f, UI_ALIGN_LEFT, UI_TEXT_3, pw, note);
+        ry0 = 210.0f;
     }
-    foot_t foot[3] = { F_CROSS("Change"), F_CIRCLE("Back"), F_KEY("SELECT", "Log") };
-    draw_footer(foot, 3);
+    const float row_h = 50.0f, row_gap = 8.0f, help_y = 528.0f;
+    int vis = (int)((help_y - 12.0f - ry0 + row_gap) / (row_h + row_gap));
+    if (vis < 1) vis = 1;
+    set_first = ui_shelf_first(set_row, set_first, vis, nrows);
+    for (int i = set_first; i < nrows && i < set_first + vis; i++) {
+        float y = ry0 + (float)(i - set_first) * (row_h + row_gap);
+        int focus = set_in_pane && i == set_row;
+        ui_glass(px, y, pw, row_h, UI_R_ROW, focus ? 1.0f : 0.0f);
+        if (focus) ui_glow(px, y, pw, row_h, UI_R_ROW, ui_glow_breath());
+        char v[64], vv[80];
+        ui_settings_value(rows[i], v, sizeof(v));
+        float label_max = pw * 0.52f - 24.0f;
+        ui_text_fit(UI_FACE_BODY, UI_T_BODY, px + 22.0f, y + 17.0f, UI_ALIGN_LEFT, UI_TEXT, label_max,
+                    ui_settings_label(rows[i]));
+        float vmax = pw * 0.48f - 28.0f;
+        if (focus) {
+            ui_fit_string(UI_FACE_BODY, UI_T_BODY, vmax - 60.0f, v, vv, sizeof(vv));
+            float vw = ui_text_width(UI_FACE_BODY, UI_T_BODY, vv);
+            float ex = px + pw - 22.0f;
+            ui_text(UI_FACE_BODY, UI_T_BODY, ex, y + 17.0f, UI_ALIGN_RIGHT, UI_ACCENT, ">");
+            ui_text(UI_FACE_BODY, UI_T_BODY, ex - 28.0f, y + 17.0f, UI_ALIGN_RIGHT, UI_TEXT, vv);
+            ui_text(UI_FACE_BODY, UI_T_BODY, ex - 28.0f - vw - 12.0f, y + 17.0f, UI_ALIGN_RIGHT, UI_ACCENT, "<");
+        } else {
+            ui_text_fit(UI_FACE_BODY, UI_T_BODY, px + pw - 22.0f, y + 17.0f, UI_ALIGN_RIGHT, UI_TEXT_2, vmax, v);
+        }
+    }
+    if (set_first > 0)
+        ui_text(UI_FACE_BODY, UI_T_MIN, px + pw - 8.0f, ry0 - 26.0f, UI_ALIGN_RIGHT, UI_TEXT_3, "more above");
+    if (set_first + vis < nrows)
+        ui_text(UI_FACE_BODY, UI_T_MIN, px + pw - 8.0f, help_y - 28.0f, UI_ALIGN_RIGHT, UI_TEXT_3, "more below");
+
+    // The help box: one or two plain sentences about the focused row.
+    char help[256];
+    if (set_in_pane) ui_settings_help(rows[set_row], help, sizeof(help));
+    else snprintf(help, sizeof(help), "Press right to change the settings in this section. Press circle to leave Settings.");
+    ui_glass(px, help_y, pw, 84.0f, UI_R_ROW, 0.0f);
+    ui_icon(UI_ICON_INFO, px + 34.0f, help_y + 42.0f, 32.0f, UI_ACCENT);
+    ui_text_wrap(UI_FACE_BODY, UI_T_SECOND, px + 66.0f, help_y + 14.0f, UI_ALIGN_LEFT, UI_TEXT_2,
+                 pw - 90.0f, 27.0f, 2, help);
+
+    foot_t foot[5];
+    int nf = 0;
+    if (set_in_pane) {
+        foot[nf++] = (foot_t)F_CROSS("Change");
+        foot[nf++] = (foot_t)F_CIRCLE("Categories");
+    } else {
+        foot[nf++] = (foot_t)F_CROSS("Open");
+        foot[nf++] = (foot_t)F_CIRCLE("Back");
+    }
+    foot[nf++] = (foot_t)F_KEY("L1 R1", "Section");
+    foot[nf++] = (foot_t)F_KEY("SELECT", "Log");
+    draw_footer(foot, nf);
 }
 
+// ===========================================================================
+// Streaming overlay.  Nothing else is ever drawn over the video.
+// ===========================================================================
 void ui_screens_draw_hud(void) {
     if (!show_stats) return;
-    char l[96];
-    snprintf(l, sizeof(l), "Rendered %d  Decoded %d  UI %d", ps3video_get_current_fps(),
-             ps3video_get_decoded_fps(), ui_fps_actual);
-    ui_text(UI_FACE_BODY, UI_T_MIN, ui_left(), ui_top(), UI_ALIGN_LEFT, UI_TEXT, l);
+    extern volatile int ps3_video_rx_kbps;    // VideoStream.c
+    extern volatile int ps3_video_rxq_bytes;  // VideoStream.c
+
+    char vals[16][64];
+    static const char *labels[16] = {
+        "Rendered FPS", "Decoded FPS", "UI loop FPS", "Decode latency", "Render latency",
+        "Network latency", "Total latency", "Resolution", "Target FPS", "Bitrate (ask / rx)",
+        "Socket buffer", "Dropped frames", "Stream link", "Audio", "Audio decode", "Audio underruns"
+    };
+    int net = ps3video_get_net_latency() / 2, dec = ps3video_get_decode_latency(), ren = ps3video_get_render_latency();
+    int decoded = ps3video_get_decoded_fps();
+    snprintf(vals[0], 64, "%d", ps3video_get_current_fps());
+    snprintf(vals[1], 64, "%d", decoded);
+    snprintf(vals[2], 64, "%d", ui_fps_actual);
+    snprintf(vals[3], 64, "%d ms", dec);
+    snprintf(vals[4], 64, "%d ms", ren);
+    snprintf(vals[5], 64, "%d ms", net);
+    snprintf(vals[6], 64, "%d ms", net + dec + ren);
+    snprintf(vals[7], 64, "%dx%d > %dx%d", ui_get_stream_width(), ui_get_stream_height(), ui_get_width(), ui_get_height());
+    snprintf(vals[8], 64, "%d", ui_get_fps());
+    snprintf(vals[9], 64, "%.1f / %.1f Mbps", (float)ui_get_bitrate() / 1000.0f, (float)ps3_video_rx_kbps / 1000.0f);
+    snprintf(vals[10], 64, "%d KB", ps3_video_rxq_bytes / 1024);
+    snprintf(vals[11], 64, "%u", (unsigned)ps3video_get_dropped_frames());
+    snprintf(vals[12], 64, "Active");
+    int ach, ahq;
+    unsigned adec, amax, aund;
+    ps3audio_get_hud(&ach, &ahq, &adec, &amax, &aund);
+    if (ach > 0) {
+        snprintf(vals[13], 64, "%s%s", ach == 8 ? "7.1" : ach == 6 ? "5.1" : "Stereo", ahq ? " HQ" : "");
+        snprintf(vals[14], 64, "%.2f / %.2f ms", adec / 1000.0f, amax / 1000.0f);
+        snprintf(vals[15], 64, "%u", aund);
+    } else {
+        snprintf(vals[13], 64, "Not running");
+        snprintf(vals[14], 64, "-");
+        snprintf(vals[15], 64, "-");
+    }
+
+    const int rows = 16;
+    const float rh = 25.0f, lab_w = 200.0f, pad = 22.0f;
+    float val_w = 330.0f;
+    float w = pad * 2.0f + lab_w + val_w, h = pad * 2.0f + rh * (float)rows;
+    float maxw = ui_lay.lw - 2.0f * UI_SAFE_X;
+    if (w > maxw) { val_w -= (w - maxw); w = maxw; }
+    float x = ui_left() - 20.0f, y = ui_top() - 10.0f;
+    if (x < 8.0f) x = 8.0f;
+    ui_glass(x, y, w, h, UI_R_ROW, 0.0f);
+
+    int target = ui_get_fps();
+    int healthy = (decoded >= target - 2);
+    for (int i = 0; i < rows; i++) {
+        float ry = y + pad + rh * (float)i;
+        ui_text(UI_FACE_BODY, UI_T_MIN, x + pad, ry, UI_ALIGN_LEFT, UI_TEXT_2, labels[i]);
+        ui_text_fit(UI_FACE_NUM, UI_T_MIN, x + pad + lab_w, ry, UI_ALIGN_LEFT, UI_TEXT, val_w, vals[i]);
+        if (i == 1) {
+            ui_col_t c = healthy ? UI_OK : UI_WARN;
+            ui_circle(x + pad - 11.0f, ry + 12.0f, 5.0f, c, ui_col_a(c, 0.8f));
+        }
+        if (i == 12) ui_spinner(x + pad + lab_w + 112.0f, ry + 12.0f, 9.0f, ui_time());
+    }
 }
 
 // ===========================================================================
@@ -767,7 +1002,8 @@ void ui_screens_input(const ps3_pad_state_t *pad) {
     if (st != input_state) {
         input_state = st;
         if (st == UI_STATE_IP_ENTRY) home_enter();
-        if (st == UI_STATE_SETTINGS) { set_cat = 0; set_row = 0; set_in_pane = 0; }
+        if (st == UI_STATE_SETTINGS) { set_cat = 0; set_row = 0; set_in_pane = 0; set_first = 0; }
+        if (st == UI_STATE_APPLIST) applist_enter();
     }
     if (st == UI_STATE_STREAMING) return;
 

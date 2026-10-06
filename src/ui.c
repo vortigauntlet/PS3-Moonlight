@@ -551,18 +551,11 @@ volatile int host_running_app = 0;      // running app id, 0 = none
 char host_running_name[64] = "";
 volatile int host_is_apollo = 0;
 volatile int quit_request = 0;
-volatile int switch_quit_request = 0;
 
 void ui_set_host_status(int running_app, const char *app_name, int apollo_family) {
     snprintf(host_running_name, sizeof(host_running_name), "%s", app_name ? app_name : "");
     host_is_apollo = apollo_family ? 1 : 0;
     host_running_app = running_app;
-}
-
-int ui_take_switch_quit(void) {
-    if (!switch_quit_request) return 0;
-    switch_quit_request = 0;
-    return 1;
 }
 
 int ui_take_quit_request(void) {
@@ -1074,6 +1067,66 @@ static const unsigned char font_8x8_basic[96][8] = {
 
 const unsigned char *ui_get_fallback_bitmap(void) { return &font_8x8_basic[0][0]; }
 
+// Layout preview: USRDIR/preview.txt forces a screen with fake data so every
+// screen can be captured without a host.  Absent in normal use.
+//   state=home|discovery|settings|pairing|applist|error|streaming
+//   running=<app id>   pin=<4 digits>   error=<text>   apps=<name>|<name>|...
+static int ui_preview = 0;
+int ui_preview_active(void) { return ui_preview; }
+
+static void ui_preview_load(void) {
+    FILE *f = fopen(CONFIG_DIR "/preview.txt", "r");
+    if (!f) return;
+    char line[256];
+    int running = 0;
+    char state[24] = "home";
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strpbrk(line, "\r\n");
+        if (nl) *nl = '\0';
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq++ = '\0';
+        if (!strcmp(line, "state")) snprintf(state, sizeof(state), "%s", eq);
+        else if (!strcmp(line, "running")) running = atoi(eq);
+        else if (!strcmp(line, "pin")) ui_set_pairing_pin(eq);
+        else if (!strcmp(line, "error")) ui_set_error_detail(eq);
+        else if (!strcmp(line, "apps")) {
+            memset(&current_app_list, 0, sizeof(current_app_list));
+            char *p = eq;
+            while (p && *p && current_app_list.count < MAX_APP_ENTRIES) {
+                char *bar = strchr(p, '|');
+                if (bar) *bar = '\0';
+                ps3_app_entry_t *a = &current_app_list.apps[current_app_list.count];
+                a->id = current_app_list.count + 1;
+                snprintf(a->name, sizeof(a->name), "%s", p);
+                current_app_list.count++;
+                p = bar ? bar + 1 : NULL;
+            }
+        }
+    }
+    fclose(f);
+    ui_preview = 1;
+    if (running) {
+        const char *nm = "";
+        for (int i = 0; i < current_app_list.count; i++)
+            if (current_app_list.apps[i].id == running) nm = current_app_list.apps[i].name;
+        ui_set_host_status(running, nm, 1);
+    }
+    if (!strcmp(state, "discovery")) {
+        snprintf(discovered_hosts[0].name, sizeof(discovered_hosts[0].name), "GAMING-PC");
+        snprintf(discovered_hosts[0].address, sizeof(discovered_hosts[0].address), "192.168.0.194");
+        snprintf(discovered_hosts[1].name, sizeof(discovered_hosts[1].name), "STUDY-DESKTOP-WITH-A-VERY-LONG-NAME");
+        snprintf(discovered_hosts[1].address, sizeof(discovered_hosts[1].address), "192.168.0.31");
+        discovered_host_count = 2;
+        discovery_scanned = 1;
+        ui_state = UI_STATE_DISCOVERY;
+    } else if (!strcmp(state, "settings")) ui_state = UI_STATE_SETTINGS;
+    else if (!strcmp(state, "pairing"))   ui_state = UI_STATE_PAIRING;
+    else if (!strcmp(state, "applist"))   ui_state = UI_STATE_APPLIST;
+    else if (!strcmp(state, "error"))     ui_state = UI_STATE_ERROR;
+    else if (!strcmp(state, "streaming")) { ui_state = UI_STATE_STREAMING; show_stats = 1; }
+}
+
 void ui_init(int width, int height) {
     ui_width = (width > 0) ? width : 1280;
     ui_height = (height > 0) ? height : 720;
@@ -1094,6 +1147,7 @@ void ui_init(int width, int height) {
 
     // Load persisted Host IP and stream settings from HDD
     ui_load_settings();
+    ui_preview_load();
     ui_theme_update();
     ui_layout_init(ui_width, ui_height, ui_output_is_4x3());
 

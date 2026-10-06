@@ -46,7 +46,6 @@ extern volatile int     host_running_app;       // running app id, 0 = none
 extern char             host_running_name[64];
 extern volatile int     host_is_apollo;
 extern volatile int     quit_request;
-extern volatile int     switch_quit_request;    // quit the running app, then launch
 extern mld_host_t       discovered_hosts[MLD_MAX_HOSTS];
 extern int              discovered_host_count;
 extern int              discovery_scanned;

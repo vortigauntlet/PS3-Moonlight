@@ -211,6 +211,11 @@ static int relocate_saved_host(int idx) {
     NLOG("Host moved: %s -> %s (%s)", old_addr, found[i].address, found[i].name);
     ui_set_host_address(idx, found[i].address, found[i].name);
     ui_save_settings();
+    {
+      char tmsg[96];
+      snprintf(tmsg, sizeof(tmsg), "%s moved to %s", found[i].name, found[i].address);
+      ui_toast(tmsg);
+    }
     return 1;
   }
   NLOG("Host with uniqueid %s not found on the LAN", want);
@@ -260,7 +265,12 @@ static void menu_probe_tick(void) {
   }
 
   if (quit_wanted) {
+    char quit_name[64];
+    snprintf(quit_name, sizeof(quit_name), "%s", menu_game_name[0] ? menu_game_name : "the game");
     hv_quit_app_background(&menu_info);
+    char qmsg[96];
+    snprintf(qmsg, sizeof(qmsg), "Quit %s", quit_name);
+    ui_toast(qmsg);
     menu_status_clear();
     menu_next_probe_us = 0;
   }
@@ -366,6 +376,13 @@ int main(int argc, char **argv) {
   NLOG("Moonlight PS3 UI Initialized");
   
   while (ui_is_running()) {
+    // Screenshot / layout preview (ui_preview_load in ui.c): the screens are
+    // forced into a state with fake data, so nothing here may touch the network.
+    if (ui_preview_active()) {
+      sysUtilCheckCallback();
+      usleep(50000);
+      continue;
+    }
     if (ui_get_state() == UI_STATE_DISCOVERY) {
       NLOG("Discovery: searching for Sunshine via mDNS...");
       mld_host_t hosts[MLD_MAX_HOSTS];
@@ -396,6 +413,9 @@ int main(int argc, char **argv) {
                ui_get_saved_host(moved)->address, hosts[i].address);
           ui_set_host_address(moved, hosts[i].address, hosts[i].name);
           ui_save_settings();
+          char tmsg[96];
+          snprintf(tmsg, sizeof(tmsg), "%s moved to %s", hosts[i].name, hosts[i].address);
+          ui_toast(tmsg);
         }
       }
       ui_set_discovered_hosts(hosts, found);
@@ -592,6 +612,7 @@ int main(int argc, char **argv) {
           char msg[160];
           snprintf(msg, sizeof(msg), "Host denies: %s. Grant in Web UI > Client Management.", missing);
           ui_push_log(msg);
+          ui_toast(msg);
           NLOG("H: %s (perm mask 0x%08x)", msg, hinfo.perm);
         }
       }
@@ -685,6 +706,7 @@ int main(int argc, char **argv) {
 
         if (ui_is_running() && connection_is_connected()) {
           NLOG("Connection fully established!");
+          ui_toast_for("To stop streaming, hold START + SELECT + L3 + R3", 4.0f);
           while (ui_is_running() && connection_is_ready() && ui_get_state() == UI_STATE_STREAMING) {
             sysUtilCheckCallback();
             

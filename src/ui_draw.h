@@ -55,7 +55,7 @@ void ui_spinner(float cx, float cy, float r, float t);
 // A status pill: dot plus label.  Returns its width.  `y` is the top.
 float ui_pill_width(const char *label);
 float ui_pill(float x, float y, const char *label, ui_col_t color);
-// The crescent-moon mark.
-void ui_moon(float cx, float cy, float r);
+// The Moonlight logo.
+void ui_logo(float cx, float cy, float r);
 
 #endif

@@ -100,11 +100,11 @@ void ui_set_host_address(int idx, const char *address, const char *name);
 void ui_set_host_status(int running_app, const char *app_name, int apollo_family);
 /* The user picked "Quit app on host"; returns 1 once per request. */
 int  ui_take_quit_request(void);
-/* The user chose to start a different app while one is running: quit the
- * running one first.  Returns 1 once per request, after the app was picked. */
-int  ui_take_switch_quit(void);
 /* Forget a saved host (the caller confirms first); fixes the selection and saves. */
 void ui_remove_saved_host(int idx);
+
+/* True when preview.txt forced the screens into a state with fake data. */
+int  ui_preview_active(void);
 
 /* A transient message pill above the footer.  Safe from any thread. */
 void ui_toast(const char *msg);

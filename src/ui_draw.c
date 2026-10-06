@@ -253,35 +253,24 @@ float ui_pill(float x, float y, const char *label, ui_col_t color) {
     return w;
 }
 
-void ui_moon(float cx, float cy, float r) {
-    // A crescent of constant horizontal thickness d: the left arc of a circle
-    // minus the same circle shifted right by d.
-    const int slices = 16;
-    float d = 0.46f * r;
-    tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-    for (int i = 0; i <= slices; i++) {
-        float s = -0.98f * r + 1.96f * r * (float)i / (float)slices;
-        float q = sqrtf(r * r - s * s);
-        float xl = cx - q;
-        float xr = xl + ((d < 2.0f * q) ? d : 2.0f * q);
-        float v = (float)i / (float)slices;
-        ui_col_t a = ui_col_mix(ui_col_a(UI_TEXT, 1.0f), ui_col_a(UI_ACCENT, 1.0f), v);
-        ui_col_t b = ui_col_mix(ui_col_a(UI_ACCENT, 1.0f), ui_col_a(UI_TEXT, 0.85f), v);
-        vtx(xl, cy + s, a);
-        vtx(xr, cy + s, b);
+void ui_logo(float cx, float cy, float r) {
+    // The Moonlight mark: a grey ring round a white disc crossed by four
+    // spokes (geometry from the project's moonlight.svg, 256 units across).
+    ui_col_t grey = UI_HEX(0x565C64);
+    ui_col_t white = { 1.0f, 1.0f, 1.0f, 1.0f };
+    ui_circle(cx, cy, r, grey, grey);
+    ui_circle(cx, cy, r * 0.75f, white, white);
+    float half = r * 0.75f * 0.99f;
+    float w = r * 0.0625f * 2.0f;
+    if (w < UI_STROKE) w = UI_STROKE;        // a visible stroke is never thinner than this
+    for (int k = 0; k < 4; k++) {
+        float a = PI_F * (float)k / 4.0f;
+        float dx = cosf(a), dy = sinf(a);
+        float px = -dy * w * 0.5f, py = dx * w * 0.5f;
+        float xy[8] = { cx - dx * half + px, cy - dy * half + py, cx + dx * half + px, cy + dy * half + py,
+                        cx + dx * half - px, cy + dy * half - py, cx - dx * half - px, cy - dy * half - py };
+        ui_col_t c[4] = { grey, grey, grey, grey };
+        ui_quad(xy, c);
     }
-    tiny3d_End();
-    // The gloss: a thin bright streak down the outer edge.
-    tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-    for (int i = 2; i <= slices - 6; i++) {
-        float s = -0.98f * r + 1.96f * r * (float)i / (float)slices;
-        float q = sqrtf(r * r - s * s);
-        float xl = cx - q + 0.06f * r;
-        float f = 1.0f - fabsf(s) / r;
-        ui_col_t c = { 1.0f, 1.0f, 1.0f, 0.55f * f };
-        ui_col_t z = { 1.0f, 1.0f, 1.0f, 0.0f };
-        vtx(xl, cy + s, c);
-        vtx(xl + 0.10f * r, cy + s, z);
-    }
-    tiny3d_End();
+    ui_circle(cx, cy, w * 0.9f, grey, grey);
 }
