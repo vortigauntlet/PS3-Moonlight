@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <time.h>
+#include <sysutil/sysutil.h>
 #include "video.h"
 #include "audio.h"
 
@@ -94,6 +95,10 @@ static void draw_title(const char *s) {
     ui_text_shadow(UI_FACE_HEAD, UI_T_TITLE, ui_left(), 108.0f, UI_ALIGN_LEFT, UI_TEXT, s);
 }
 
+static int ui_confirm_button, ui_cancel_button;
+static const char *ui_confirm_glyph, *ui_cancel_glyph;
+static ui_col_t ui_confirm_col, ui_cancel_col;
+
 typedef struct { const char *key; ui_col_t col; const char *label; } foot_t;
 
 static float foot_item(float x, float y, const foot_t *f) {
@@ -118,8 +123,8 @@ static void draw_footer(const foot_t *items, int n) {
     for (int i = 0; i < n; i++) x += foot_item(x, fy, &items[i]) + 32.0f;
 }
 
-#define F_CROSS(l)    { UI_G_CROSS, UI_PS_CROSS, l }
-#define F_CIRCLE(l)   { UI_G_CIRCLE, UI_PS_CIRCLE, l }
+#define F_CONFIRM(l)  { ui_confirm_glyph, ui_confirm_col, l }
+#define F_CANCEL(l)   { ui_cancel_glyph, ui_cancel_col, l }
 #define F_TRIANGLE(l) { UI_G_TRIANGLE, UI_PS_TRIANGLE, l }
 #define F_SQUARE(l)   { UI_G_SQUARE, UI_PS_SQUARE, l }
 #define F_KEY(k, l)   { k, UI_TEXT_2, l }
@@ -266,14 +271,14 @@ static void options_input(const ps3_pad_state_t *p) {
     int items[4];
     int n = options_items(items);
     if (opt_info) {
-        if (p->buttons_pressed & (B_FLAG | Y_FLAG | A_FLAG)) opt_info = 0;
+        if (p->buttons_pressed & (ui_cancel_button | Y_FLAG | ui_confirm_button)) opt_info = 0;
         return;
     }
     opt_item = clampi(opt_item, 0, n - 1);
     if (p->buttons_pressed & UP_FLAG)   opt_item = (opt_item + n - 1) % n;
     if (p->buttons_pressed & DOWN_FLAG) opt_item = (opt_item + 1) % n;
-    if (p->buttons_pressed & (B_FLAG | Y_FLAG)) { opt_open = 0; return; }
-    if (p->buttons_pressed & A_FLAG) {
+    if (p->buttons_pressed & (ui_cancel_button | Y_FLAG)) { opt_open = 0; return; }
+    if (p->buttons_pressed & ui_confirm_button) {
         switch (items[opt_item]) {
         case OP_CONNECT: opt_open = 0; connect_to(home_focus); break;
         case OP_QUIT:    opt_open = 0; quit_request = 1; break;
@@ -302,7 +307,7 @@ static void home_input(const ps3_pad_state_t *p) {
     if (p->buttons_pressed & RIGHT_FLAG) home_focus = clampi(home_focus + 1, 0, n - 1);
 
     int kind = kinds[home_focus];
-    if (p->buttons_pressed & A_FLAG) {
+    if (p->buttons_pressed & ui_confirm_button) {
         if (kind == IT_HOST) connect_to(home_focus);
         else if (kind == IT_ADD || kind == IT_EMPTY) { ui_reset_host_selection(); ui_set_state(UI_STATE_DISCOVERY); }
         else ui_set_state(UI_STATE_SETTINGS);
@@ -313,7 +318,7 @@ static void home_input(const ps3_pad_state_t *p) {
     }
     // START still connects to the focused PC, as it always has.
     if ((p->buttons_pressed & PLAY_FLAG) && kind == IT_HOST) connect_to(home_focus);
-    if (p->buttons_pressed & B_FLAG) ui_open_exit_dialog();
+    if (p->buttons_pressed & ui_cancel_button) ui_open_exit_dialog();
 }
 
 static void draw_card_host(float x, float y, float f, float alpha, int idx) {
@@ -396,7 +401,7 @@ static void draw_empty_card(float x, float y, float f, float alpha) {
     ui_text_wrap(UI_FACE_BODY, UI_T_SECOND, x0 + 36.0f, y0 + 120.0f, UI_ALIGN_LEFT, UI_TEXT_2,
                  ww - 72.0f, 30.0f, 4,
                  "Make sure Sunshine or Apollo is running on your PC and that it's on the same network as your PS3.");
-    foot_t search = F_CROSS("Search for PCs");
+    foot_t search = F_CONFIRM("Search for PCs");
     foot_item(x0 + 36.0f, y0 + hh - 56.0f, &search);
     ui_set_alpha(sa);
 }
@@ -543,15 +548,15 @@ static void draw_home(void) {
     if (opt_open) {
         foot_t of[3];
         int no = 0;
-        of[no++] = (foot_t)F_CROSS(opt_info ? "Back" : "Choose");
-        of[no++] = (foot_t)F_CIRCLE("Close");
+        of[no++] = (foot_t)F_CONFIRM(opt_info ? "Back" : "Choose");
+        of[no++] = (foot_t)F_CANCEL("Close");
         draw_footer(of, no);
     } else {
         foot_t foot[4];
         int nf = 0;
-        foot[nf++] = (foot_t)F_CROSS(kind == IT_HOST ? "Connect" : kind == IT_SETTINGS ? "Open" : "Search");
+        foot[nf++] = (foot_t)F_CONFIRM(kind == IT_HOST ? "Connect" : kind == IT_SETTINGS ? "Open" : "Search");
         if (kind == IT_HOST) foot[nf++] = (foot_t)F_TRIANGLE("Options");
-        foot[nf++] = (foot_t)F_CIRCLE("Exit");
+        foot[nf++] = (foot_t)F_CANCEL("Exit");
         foot[nf++] = (foot_t)F_KEY("SELECT", "Log");
         draw_footer(foot, nf);
     }
@@ -576,12 +581,12 @@ static void discovery_input(const ps3_pad_state_t *p) {
         int rows = discovered_host_count + 1;
         if (p->buttons_pressed & UP_FLAG)   active_host_idx = (active_host_idx + rows - 1) % rows;
         if (p->buttons_pressed & DOWN_FLAG) active_host_idx = (active_host_idx + 1) % rows;
-        if (p->buttons_pressed & A_FLAG) {
+        if (p->buttons_pressed & ui_confirm_button) {
             if (active_host_idx == discovered_host_count) manual_entry_requested = 1;
             else host_selection_confirmed = 1;
         }
     }
-    if (p->buttons_pressed & B_FLAG) {
+    if (p->buttons_pressed & ui_cancel_button) {
         ui_reset_host_selection();
         ui_set_state(UI_STATE_IP_ENTRY);
     }
@@ -628,8 +633,8 @@ static void draw_discovery(void) {
     }
     foot_t foot[3];
     int nf = 0;
-    if (discovery_scanned) foot[nf++] = (foot_t)F_CROSS("Select");
-    foot[nf++] = (foot_t)F_CIRCLE("Back");
+    if (discovery_scanned) foot[nf++] = (foot_t)F_CONFIRM("Select");
+    foot[nf++] = (foot_t)F_CANCEL("Back");
     foot[nf++] = (foot_t)F_KEY("SELECT", "Log");
     draw_footer(foot, nf);
 }
@@ -644,7 +649,7 @@ static void selected_host_name(char *out, size_t n) {
 }
 
 static void pairing_input(const ps3_pad_state_t *p) {
-    if (p->buttons_pressed & B_FLAG) ui_set_state(UI_STATE_IP_ENTRY);
+    if (p->buttons_pressed & ui_cancel_button) ui_set_state(UI_STATE_IP_ENTRY);
 }
 
 static void draw_pairing(void) {
@@ -683,7 +688,7 @@ static void draw_pairing(void) {
         ui_spinner(sx + 14.0f, y + h - 44.0f, 14.0f, ui_time());
         ui_text(UI_FACE_BODY, UI_T_SECOND, sx + 44.0f, y + h - 58.0f, UI_ALIGN_LEFT, UI_TEXT, "Waiting for your PC...");
     }
-    foot_t foot[2] = { F_CIRCLE("Cancel"), F_KEY("SELECT", "Log") };
+    foot_t foot[2] = { F_CANCEL("Cancel"), F_KEY("SELECT", "Log") };
     draw_footer(foot, 2);
 }
 
@@ -691,7 +696,7 @@ static void draw_pairing(void) {
 // Error
 // ===========================================================================
 static void error_input(const ps3_pad_state_t *p) {
-    if (p->buttons_pressed & A_FLAG) {
+    if (p->buttons_pressed & ui_confirm_button) {
         ui_set_state(UI_STATE_IP_ENTRY);
         ui_error_detail[0] = '\0';
     }
@@ -730,7 +735,7 @@ static void draw_error(void) {
         ui_text_fit(UI_FACE_BODY, UI_T_SECOND, x + 74.0f, cy + (float)i * 34.0f, UI_ALIGN_LEFT, UI_TEXT_2,
                     inner - 24.0f, tips[i]);
     }
-    foot_t foot[2] = { F_CROSS("OK"), F_KEY("SELECT", "Show log") };
+    foot_t foot[2] = { F_CONFIRM("OK"), F_KEY("SELECT", "Show log") };
     draw_footer(foot, 2);
 }
 
@@ -751,9 +756,9 @@ static void applist_input(const ps3_pad_state_t *p) {
     if (n > 0) {
         if (p->buttons_pressed & UP_FLAG)   active_app_idx = (active_app_idx + n - 1) % n;
         if (p->buttons_pressed & DOWN_FLAG) active_app_idx = (active_app_idx + 1) % n;
-        if (p->buttons_pressed & A_FLAG)    app_selection_confirmed = 1;
+        if (p->buttons_pressed & ui_confirm_button)    app_selection_confirmed = 1;
     }
-    if (p->buttons_pressed & B_FLAG) {
+    if (p->buttons_pressed & ui_cancel_button) {
         app_selection_confirmed = 0;
         ui_set_state(UI_STATE_IP_ENTRY);
     }
@@ -805,7 +810,7 @@ static void draw_applist(void) {
                     ui_lay.lw - 2.0f * UI_SAFE_X, m);
         ui_set_alpha(sa);
     } else {
-        foot_t foot[3] = { F_CROSS("Play"), F_CIRCLE("Back"), F_KEY("SELECT", "Log") };
+        foot_t foot[3] = { F_CONFIRM("Play"), F_CANCEL("Back"), F_KEY("SELECT", "Log") };
         draw_footer(foot, 3);
     }
 }
@@ -824,16 +829,16 @@ static void settings_input(const ps3_pad_state_t *p) {
     if (!set_in_pane) {
         if (p->buttons_pressed & UP_FLAG)   set_cat = (set_cat + ncat - 1) % ncat;
         if (p->buttons_pressed & DOWN_FLAG) set_cat = (set_cat + 1) % ncat;
-        if (p->buttons_pressed & (RIGHT_FLAG | A_FLAG)) { set_in_pane = 1; set_row = 0; set_first = 0; }
+        if (p->buttons_pressed & (RIGHT_FLAG | ui_confirm_button)) { set_in_pane = 1; set_row = 0; set_first = 0; }
     } else {
         if (p->buttons_pressed & UP_FLAG)   set_row = (set_row + nrows - 1) % nrows;
         if (p->buttons_pressed & DOWN_FLAG) set_row = (set_row + 1) % nrows;
         if (p->buttons_pressed & LEFT_FLAG) ui_settings_change(rows[set_row], -1);
-        if (p->buttons_pressed & (RIGHT_FLAG | A_FLAG)) ui_settings_change(rows[set_row], 1);
+        if (p->buttons_pressed & (RIGHT_FLAG | ui_confirm_button)) ui_settings_change(rows[set_row], 1);
     }
     if (p->buttons_pressed & LB_FLAG) { set_cat = (set_cat + ncat - 1) % ncat; set_row = 0; set_first = 0; }
     if (p->buttons_pressed & RB_FLAG) { set_cat = (set_cat + 1) % ncat; set_row = 0; set_first = 0; }
-    if (p->buttons_pressed & B_FLAG) {
+    if (p->buttons_pressed & ui_cancel_button) {
         if (set_in_pane) set_in_pane = 0;
         else { ui_save_settings(); ui_set_state(UI_STATE_IP_ENTRY); }
     }
@@ -909,11 +914,11 @@ static void draw_settings(void) {
     foot_t foot[5];
     int nf = 0;
     if (set_in_pane) {
-        foot[nf++] = (foot_t)F_CROSS("Change");
-        foot[nf++] = (foot_t)F_CIRCLE("Categories");
+        foot[nf++] = (foot_t)F_CONFIRM("Change");
+        foot[nf++] = (foot_t)F_CANCEL("Categories");
     } else {
-        foot[nf++] = (foot_t)F_CROSS("Open");
-        foot[nf++] = (foot_t)F_CIRCLE("Back");
+        foot[nf++] = (foot_t)F_CONFIRM("Open");
+        foot[nf++] = (foot_t)F_CANCEL("Back");
     }
     foot[nf++] = (foot_t)F_KEY("L1 R1", "Section");
     foot[nf++] = (foot_t)F_KEY("SELECT", "Log");
@@ -992,6 +997,19 @@ void ui_screens_draw_hud(void) {
 static int input_state = -1;
 
 void ui_screens_init(void) {
+    // Which face button confirms varies between systems.
+    // Circle is used on Japanese models, everyone else uses Cross.
+    // Preference can be changed either from XMB Debug Settings (DEX) or by
+    // directly editing xRegistry like how webMAN MOD does.
+    int assign = 1;     // 0 = Circle, 1 = Cross
+    if (sysUtilGetSystemParamInt(SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN, &assign) != 0) assign = 1;
+    ui_confirm_button = (assign) ? A_FLAG : B_FLAG;
+    ui_confirm_glyph = (assign) ? UI_G_CROSS : UI_G_CIRCLE;
+    ui_confirm_col = (assign) ? UI_PS_CROSS : UI_PS_CIRCLE;
+    ui_cancel_button  = (assign) ? B_FLAG : A_FLAG;
+    ui_cancel_glyph  = (assign) ? UI_G_CIRCLE : UI_G_CROSS;
+    ui_cancel_col  = (assign) ? UI_PS_CIRCLE : UI_PS_CROSS;
+
     shown_state = -1;
     input_state = -1;
     trans_t = 1.0f;
@@ -1009,7 +1027,7 @@ void ui_screens_input(const ps3_pad_state_t *pad) {
 
     // SELECT shows the log on any menu screen.
     if (pad->buttons_pressed & BACK_FLAG) log_open = !log_open;
-    if (log_open && (pad->buttons_pressed & B_FLAG)) { log_open = 0; return; }
+    if (log_open && (pad->buttons_pressed & ui_cancel_button)) { log_open = 0; return; }
 
     switch (st) {
     case UI_STATE_IP_ENTRY:  home_input(pad); break;
